@@ -31,6 +31,12 @@ from typing import Optional
 
 import aiohttp
 
+from perf import (
+    json_loads, json_dumps, create_session,
+    orderbook_ws_stream, get_cached_orderbook, fetch_orderbook_rest,
+    update_ui, ui_renderer, adaptive_sleep,
+)
+
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION (mirrors sniper.py exactly)
@@ -191,55 +197,51 @@ class Stats:
 # BTC PRICE STREAM — Binance WebSocket + HTTP Fallback
 # ─────────────────────────────────────────────────────────────
 
-async def btc_price_stream():
+async def btc_price_stream(session: aiohttp.ClientSession):
     """Stream BTC/USD via Binance WebSocket with staleness detection & auto-reconnect."""
     global btc_price, btc_price_updated, price_feed_status
     reconnect_delay = 1
     max_reconnect = 30
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            # ── Try Binance WebSocket (real-time) ──
-            try:
-                async with session.ws_connect(
-                    BINANCE_WS_URL,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as ws:
-                    reconnect_delay = 1  # Reset on successful connect
-                    price_feed_status = "ws_live"
-                    while True:
-                        try:
-                            msg = await asyncio.wait_for(
-                                ws.__anext__(), timeout=PRICE_STALE_RECONNECT
-                            )
-                        except (asyncio.TimeoutError, StopAsyncIteration):
-                            price_feed_status = "stale"
-                            break
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            btc_price = float(data["p"])
-                            btc_price_updated = time.time()
-                            price_feed_status = "ws_live"
-                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                            price_feed_status = "stale"
-                            break
-            except Exception:
-                price_feed_status = "stale"
-
-            # ── Fallback: CoinCap HTTP poll ──
-            try:
-                async with session.get(COINCAP_URL, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        btc_price = float(data["data"]["priceUsd"])
+    while True:
+        try:
+            async with session.ws_connect(
+                BINANCE_WS_URL,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as ws:
+                reconnect_delay = 1
+                price_feed_status = "ws_live"
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(
+                            ws.__anext__(), timeout=PRICE_STALE_RECONNECT
+                        )
+                    except (asyncio.TimeoutError, StopAsyncIteration):
+                        price_feed_status = "stale"
+                        break
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json_loads(msg.data)
+                        btc_price = float(data["p"])
                         btc_price_updated = time.time()
-                        price_feed_status = "http_fallback"
-            except Exception:
-                pass
+                        price_feed_status = "ws_live"
+                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                        price_feed_status = "stale"
+                        break
+        except Exception:
+            price_feed_status = "stale"
 
-            # Reconnect with backoff
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, max_reconnect)
+        try:
+            async with session.get(COINCAP_URL, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    btc_price = float(data["data"]["priceUsd"])
+                    btc_price_updated = time.time()
+                    price_feed_status = "http_fallback"
+        except Exception:
+            pass
+
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, max_reconnect)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -314,30 +316,11 @@ async def discover_market(session: aiohttp.ClientSession) -> Optional[dict]:
 async def fetch_orderbook(
     session: aiohttp.ClientSession, token_id: str
 ) -> dict:
-    """Fetch full orderbook from CLOB REST API. Returns best ask/bid/size/spread."""
-    result = {"ask_price": 0.0, "ask_size": 0.0, "bid_price": 0.0, "spread": 0.0, "depth_usd": 0.0}
-    try:
-        url = f"{CLOB_HOST}/book"
-        params = {"token_id": token_id}
-        async with session.get(url, params=params) as resp:
-            if resp.status != 200:
-                return result
-            data = await resp.json()
-            asks = data.get("asks", [])
-            bids = data.get("bids", [])
-            if asks:
-                best_ask = min(asks, key=lambda a: float(a.get("price", 999)))
-                result["ask_price"] = float(best_ask["price"])
-                result["ask_size"] = float(best_ask.get("size", 0))
-                result["depth_usd"] = result["ask_price"] * result["ask_size"]
-            if bids:
-                best_bid = max(bids, key=lambda b: float(b.get("price", 0)))
-                result["bid_price"] = float(best_bid["price"])
-            if result["ask_price"] > 0 and result["bid_price"] > 0:
-                result["spread"] = result["ask_price"] - result["bid_price"]
-            return result
-    except Exception:
-        return result
+    """Get orderbook: WS cache first, REST fallback."""
+    ob = get_cached_orderbook(token_id)
+    if ob["ask_price"] > 0:
+        return ob
+    return await fetch_orderbook_rest(session, token_id)
 
 
 async def fetch_best_ask(
@@ -601,6 +584,112 @@ def print_waiting(market: dict, remaining: float, candle_open: float, stats: Sta
 
 
 # ─────────────────────────────────────────────────────────────
+# BUILD SCREEN (for decoupled UI renderer)
+# ─────────────────────────────────────────────────────────────
+
+def build_screen(state: dict) -> str:
+    """Build the entire dashboard into a single string for the UI renderer."""
+    import io
+    buf = io.StringIO()
+    w = buf.write
+
+    market = state.get("market")
+    remaining = state.get("remaining", 0)
+    candle_open = state.get("candle_open", 0)
+    stats = state.get("stats")
+    trade_window = state.get("trade_window", DEFAULT_TRADE_WINDOW)
+
+    if not market or not stats:
+        return ""
+
+    now = datetime.now(timezone.utc)
+    event_start = market["event_start"]
+    to_start = (event_start - now).total_seconds()
+
+    delta = btc_price - candle_open if candle_open > 0 else 0
+    delta_sign = "+" if delta >= 0 else ""
+    dir_c = GREEN if delta >= 0 else RED
+    direction = "UP 📈" if delta >= 0 else "DOWN 📉"
+    abs_delta = abs(delta)
+
+    if abs_delta < SAFE_BUFFER_USD:
+        verdict = f"{YELLOW}RISKY (delta ${abs_delta:,.0f} < ${SAFE_BUFFER_USD:.0f} buffer){R}"
+    elif remaining > trade_window:
+        verdict = f"{CYAN}MONITORING — execution in {int(remaining - trade_window)}s{R}"
+    else:
+        verdict = f"{RED}{B}🔥 EXECUTION WINDOW{R}"
+
+    bal_c = GREEN if stats.balance >= STARTING_BALANCE else RED
+    bet_size = min(MAX_TRADE_USD, stats.balance)
+
+    w(f"{B}{'═' * 64}{R}\n")
+    w(f"{B}  📝 POLYSNIPER — $100 PAPER TRADING{R}\n")
+    w(f"{B}{'═' * 64}{R}\n")
+    w(f"  {D}{market['title']}{R}\n")
+    w(f"  💰 Balance: {bal_c}{B}${stats.balance:.4f}{R}  "
+      f"│  Next bet: ${bet_size:.2f}\n")
+    w("\n")
+
+    if to_start > 0:
+        w(f"  ⏳ Candle starts in {B}{format_countdown(to_start)}{R}\n")
+    else:
+        bar_len = 30
+        filled = max(0, int((remaining / 300) * bar_len))
+        bar = "█" * filled + "░" * (bar_len - filled)
+        cd = format_countdown(remaining)
+        cd_c = f"{RED}{B}" if remaining <= trade_window else B
+        w(f"  ⏱️  Remaining: {cd_c}{cd}{R}  [{bar}]\n")
+
+    w("\n")
+    stale_age = time.time() - btc_price_updated if btc_price_updated > 0 else 0
+    stale_warn = f"  {RED}⚠️  Price data is {int(stale_age)}s stale!{R}" if stale_age > PRICE_STALE_SECONDS else ""
+    if price_feed_status == "ws_live":
+        feed_icon = f"{GREEN}🟢 WS Live{R}"
+    elif price_feed_status == "http_fallback":
+        feed_icon = f"{YELLOW}🟡 HTTP Fallback{R}"
+    else:
+        feed_icon = f"{RED}🔴 {price_feed_status.upper()}{R}"
+    w(f"  ₿ BTC:  {B}${btc_price:>12,.2f}{R}  {feed_icon}{stale_warn}\n")
+    if candle_open > 0:
+        w(f"  📌 Open: ${candle_open:>12,.2f}    "
+          f"Delta: {dir_c}{delta_sign}${delta:>10,.2f}{R}    "
+          f"{dir_c}{direction}{R}\n")
+    w(f"  🎯 {verdict}\n")
+
+    if stats.total_candles > 0:
+        pnl_c = GREEN if stats.total_pnl >= 0 else RED
+        pnl_s = "+" if stats.total_pnl >= 0 else ""
+        w("\n")
+        w(f"  {D}─── Session: {stats.total_trades} trades | "
+          f"{stats.win_rate:.0f}% win rate | "
+          f"P&L: {pnl_s}${stats.total_pnl:.4f} ───{R}\n")
+
+    if stats.trades:
+        lt = stats.trades[-1]
+        w("\n")
+        w(f"  {B}{'─' * 64}{R}\n")
+        w(f"  {B}📋 LAST TRADE (Candle #{lt.candle_num}){R}\n")
+        w(f"  {B}{'─' * 64}{R}\n")
+        if lt.decision.startswith("BUY"):
+            result_c = GREEN if lt.won else RED
+            result_icon = "✅ WON" if lt.won else "❌ LOST"
+            pnl_sign = "+" if lt.pnl >= 0 else ""
+            w(f"  │ Result:     {result_c}{B}{result_icon}{R}\n")
+            w(f"  │ Bet:        ${lt.bet_amount:.2f}  │  "
+              f"P&L: {result_c}{pnl_sign}${lt.pnl:.4f}{R}\n")
+        else:
+            reason = lt.decision.replace("SKIP_", "")
+            w(f"  │ Decision:   {YELLOW}SKIPPED — {reason}{R}\n")
+        w(f"  {B}{'─' * 64}{R}\n")
+
+    w("\n")
+    w(f"  {D}Ctrl+C to stop and see final report{R}\n")
+    w(f"{B}{'═' * 64}{R}\n")
+
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────
 # CANDLE SIMULATION
 # ─────────────────────────────────────────────────────────────
 
@@ -645,13 +734,19 @@ async def simulate_candle(
     decision_remaining = 0.0
     confidence = ""
 
+    # ── Launch WS orderbook streams for both tokens ──
+    ws_stop = asyncio.Event()
+    ws_up_task = asyncio.create_task(orderbook_ws_stream(token_up, ws_stop))
+    ws_dn_task = asyncio.create_task(orderbook_ws_stream(token_down, ws_stop))
+
     # ── Wait for candle to start ──
     while True:
         now = datetime.now(timezone.utc)
         to_start = (event_start - now).total_seconds()
         if to_start <= 0:
             break
-        print_waiting(market, 300, 0, stats, trade_window)
+        update_ui(market=market, remaining=300, candle_open=0,
+                  stats=stats, trade_window=trade_window)
         await asyncio.sleep(1)
 
     # Record open price
@@ -673,7 +768,9 @@ async def simulate_candle(
             btc_low = min(btc_low, btc_price)
 
         # Show live status
-        print_waiting(market, remaining, candle_open, stats, trade_window)
+        # Update UI state (rendered by background task)
+        update_ui(market=market, remaining=remaining, candle_open=candle_open,
+                  stats=stats, trade_window=trade_window)
 
         # ── Sniper decision within trade window ──
         if remaining <= trade_window and not order_simulated:
@@ -760,9 +857,14 @@ async def simulate_candle(
                         buy_price = ask_price
                         order_simulated = True
 
-        await asyncio.sleep(1)
+        await adaptive_sleep(remaining, trade_window)
 
-    # ── Candle closed — determine actual result ──
+    # ── Candle closed — cleanup WS streams ──
+    ws_stop.set()
+    ws_up_task.cancel()
+    ws_dn_task.cancel()
+
+    # ── Determine actual result ──
     close_price = btc_price
     delta = close_price - candle_open
     actual_direction = "UP" if delta >= 0 else "DOWN"
@@ -925,7 +1027,10 @@ def print_final_report(stats: Stats):
 
 async def main(max_candles: int | None = None, trade_window: int = DEFAULT_TRADE_WINDOW):
     """Run paper trader across multiple candles."""
-    price_task = asyncio.create_task(btc_price_stream())
+    session = create_session()
+    shutdown = asyncio.Event()
+    price_task = asyncio.create_task(btc_price_stream(session))
+    ui_task = asyncio.create_task(ui_renderer(build_screen, shutdown))
 
     print("⏳ Fetching live BTC price...")
     elapsed = 0
@@ -943,72 +1048,70 @@ async def main(max_candles: int | None = None, trade_window: int = DEFAULT_TRADE
     candle_num = 0
 
     try:
-        async with aiohttp.ClientSession() as session:
-            while True:
-                if max_candles and candle_num >= max_candles:
-                    break
+        while True:
+            if max_candles and candle_num >= max_candles:
+                break
 
-                # ── Drawdown circuit breaker ──
-                if stats.cooldown_remaining > 0:
-                    stats.cooldown_remaining -= 1
-                    print(f"\n  {YELLOW}⏸️  Drawdown cooldown: sitting out "
-                          f"({stats.cooldown_remaining + 1} candles remaining){R}")
-                    # Still need to discover market to stay in sync
-                    market = await discover_market(session)
-                    if market:
-                        candle_num += 1
-                    await asyncio.sleep(5)
-                    continue
-
-                # ── Consecutive loss cooldown ──
-                if stats.current_streak <= -LOSS_STREAK_LIMIT:
-                    print(f"\n  {YELLOW}🧊 Loss streak cooldown: {abs(stats.current_streak)} "
-                          f"consecutive losses — skipping 1 candle{R}")
-                    stats.current_streak = -(LOSS_STREAK_LIMIT - 1)  # Reset so we only skip 1
-                    market = await discover_market(session)
-                    if market:
-                        candle_num += 1
-                    await asyncio.sleep(5)
-                    continue
-
+            # ── Drawdown circuit breaker ──
+            if stats.cooldown_remaining > 0:
+                stats.cooldown_remaining -= 1
+                print(f"\n  {YELLOW}⏸️  Drawdown cooldown: sitting out "
+                      f"({stats.cooldown_remaining + 1} candles remaining){R}")
                 market = await discover_market(session)
-                if market is None:
-                    print("⚠️  No market found. Retrying in 15s...")
-                    await asyncio.sleep(15)
-                    continue
+                if market:
+                    candle_num += 1
+                await asyncio.sleep(5)
+                continue
 
-                candle_num += 1
+            # ── Consecutive loss cooldown ──
+            if stats.current_streak <= -LOSS_STREAK_LIMIT:
+                print(f"\n  {YELLOW}🧲 Loss streak cooldown: {abs(stats.current_streak)} "
+                      f"consecutive losses — skipping 1 candle{R}")
+                stats.current_streak = -(LOSS_STREAK_LIMIT - 1)
+                market = await discover_market(session)
+                if market:
+                    candle_num += 1
+                await asyncio.sleep(5)
+                continue
 
-                # Simulate the full candle
-                trade = await simulate_candle(session, market, candle_num, stats, trade_window)
+            market = await discover_market(session)
+            if market is None:
+                print("⚠️  No market found. Retrying in 15s...")
+                await asyncio.sleep(15)
+                continue
 
-                # Record results
-                stats.record(trade)
-                log_trade_csv(CSV_FILE, trade, stats)
+            candle_num += 1
 
-                # ── Check drawdown after recording ──
-                if (stats.peak_balance > 0 and
-                        stats.balance < stats.peak_balance * DRAWDOWN_THRESHOLD):
-                    stats.cooldown_remaining = DRAWDOWN_COOLDOWN
-                    print(f"\n  {RED}🛑 DRAWDOWN BREAKER: balance ${stats.balance:.4f} < "
-                          f"50% of peak ${stats.peak_balance:.4f} — pausing {DRAWDOWN_COOLDOWN} candles{R}")
+            trade = await simulate_candle(session, market, candle_num, stats, trade_window)
 
-                # Show result
-                clear()
-                print(f"\n{B}{'═' * 64}{R}")
-                print(f"{B}  📝 CANDLE #{candle_num} RESULT{R}")
-                print(f"{B}{'═' * 64}{R}")
-                print()
-                print_trade_result(trade)
-                print_stats(stats)
-                print()
+            stats.record(trade)
+            log_trade_csv(CSV_FILE, trade, stats)
 
-                # Brief pause before next candle
-                await asyncio.sleep(3)
+            # ── Check drawdown after recording ──
+            if (stats.peak_balance > 0 and
+                    stats.balance < stats.peak_balance * DRAWDOWN_THRESHOLD):
+                stats.cooldown_remaining = DRAWDOWN_COOLDOWN
+                print(f"\n  {RED}🛑 DRAWDOWN BREAKER: balance ${stats.balance:.4f} < "
+                      f"50% of peak ${stats.peak_balance:.4f} — pausing {DRAWDOWN_COOLDOWN} candles{R}")
+
+            # Show result
+            clear()
+            print(f"\n{B}{'═' * 64}{R}")
+            print(f"{B}  📝 CANDLE #{candle_num} RESULT{R}")
+            print(f"{B}{'═' * 64}{R}")
+            print()
+            print_trade_result(trade)
+            print_stats(stats)
+            print()
+
+            await asyncio.sleep(3)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
+        shutdown.set()
         price_task.cancel()
+        ui_task.cancel()
+        await session.close()
         print_final_report(stats)
 
 

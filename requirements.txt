@@ -2,3 +2,5 @@ py-clob-client
 websockets
 aiohttp
 python-dotenv
+orjson
+numpy
