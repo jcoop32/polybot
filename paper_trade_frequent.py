@@ -559,6 +559,7 @@ async def simulate_candle(
 
     Returns a Trade with full details.
     """
+    global circuit_breaker_active, circuit_breaker_until
     event_start = market["event_start"]
     event_end = market["event_end"]
     token_up = market["token_up_id"]
