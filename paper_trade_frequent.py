@@ -52,6 +52,10 @@ MAX_TRADE_USD = 5.0            # Simulated trade size per candle
 MIN_ASK_SIZE_USD = 2.0         # Lowered to ensure frequent fills
 DECISION_SECOND = 15           # Make the decision at T+15s into the 300s candle
 
+# Circuit breaker
+CIRCUIT_BREAKER_LOSSES = 3     # Consecutive losses to trigger cooldown
+CIRCUIT_BREAKER_COOLDOWN = 1800  # 30 minute cooldown (seconds)
+
 # BTC price staleness
 PRICE_STALE_SECONDS = 10
 PRICE_STALE_RECONNECT = 30
@@ -60,7 +64,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 COINCAP_URL = "https://api.coincap.io/v2/assets/bitcoin"
 
-CSV_FILE = "paper_trades_frequent.csv"
+CSV_FILE = "paper_trades_frequent_v2.csv"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -70,6 +74,11 @@ CSV_FILE = "paper_trades_frequent.csv"
 btc_price: float = 0.0
 btc_price_updated: float = 0.0
 price_feed_status: str = "connecting"
+bot_start_time: float = time.time()
+
+# Circuit breaker state
+circuit_breaker_active: bool = False
+circuit_breaker_until: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -135,6 +144,7 @@ class Stats:
         return ((self.balance - STARTING_BALANCE) / STARTING_BALANCE * 100)
 
     def record(self, trade: Trade):
+        global circuit_breaker_active, circuit_breaker_until
         self.trades.append(trade)
         self.total_candles += 1
 
@@ -151,10 +161,18 @@ class Stats:
                 self.wins += 1
                 self.current_streak = max(0, self.current_streak) + 1
                 self.longest_win_streak = max(self.longest_win_streak, self.current_streak)
+                # Win clears circuit breaker
+                if circuit_breaker_active:
+                    circuit_breaker_active = False
+                    circuit_breaker_until = 0.0
             else:
                 self.losses += 1
                 self.current_streak = min(0, self.current_streak) - 1
                 self.longest_loss_streak = max(self.longest_loss_streak, abs(self.current_streak))
+                # Check circuit breaker trigger
+                if abs(self.current_streak) >= CIRCUIT_BREAKER_LOSSES:
+                    circuit_breaker_active = True
+                    circuit_breaker_until = time.time() + CIRCUIT_BREAKER_COOLDOWN
 
             self.best_trade = max(self.best_trade, trade.pnl)
             self.worst_trade = min(self.worst_trade, trade.pnl)
@@ -370,6 +388,20 @@ def format_countdown(seconds: float) -> str:
     return f"{m}m {s:02d}s" if m > 0 else f"{s}s"
 
 
+def format_uptime(start: float) -> str:
+    """Format elapsed time since bot start as Xh Ym Zs."""
+    elapsed = int(time.time() - start)
+    h = elapsed // 3600
+    m = (elapsed % 3600) // 60
+    s = elapsed % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    elif m > 0:
+        return f"{m}m {s:02d}s"
+    else:
+        return f"{s}s"
+
+
 def build_screen(state: dict) -> str:
     """Build the entire dashboard into a single string for the UI renderer."""
     buf = io.StringIO()
@@ -403,7 +435,8 @@ def build_screen(state: dict) -> str:
     w(f"{B}{'═' * 64}{R}\n")
     w(f"  {D}{market['title']}{R}\n")
     w(f"  💰 Balance: {bal_c}{B}${stats.balance:.4f}{R}  "
-      f"│  Next bet: ${bet_size:.2f}\n")
+      f"│  Next bet: ${bet_size:.2f}  "
+      f"│  🕐 Uptime: {B}{format_uptime(bot_start_time)}{R}\n")
     w("\n")
 
     # ── Timer ──
@@ -452,6 +485,13 @@ def build_screen(state: dict) -> str:
     else:
         phase_str = f"{D}—{R}"
     w(f"  🎯 {phase_str}\n")
+
+    # ── Circuit breaker status ──
+    if circuit_breaker_active:
+        cb_remaining = max(0, circuit_breaker_until - time.time())
+        cb_mins = int(cb_remaining) // 60
+        cb_secs = int(cb_remaining) % 60
+        w(f"  {RED}🔌 CIRCUIT BREAKER — Cooling down ({cb_mins}m {cb_secs:02d}s remaining){R}\n")
 
     # ── Session summary ──
     if stats.total_candles > 0:
@@ -589,43 +629,52 @@ async def simulate_candle(
             elif stats.balance < 0.001:
                 decision = "SKIP_NO_BALANCE"
                 order_simulated = True
-            elif decision_delta == 0:
-                decision = "SKIP_FLAT"
+            elif circuit_breaker_active and time.time() < circuit_breaker_until:
+                decision = "SKIP_COOLDOWN"
                 order_simulated = True
             else:
-                # Determine direction
-                if decision_delta > 0:
-                    target_side = "UP"
-                    target_token = token_up
-                else:
-                    target_side = "DOWN"
-                    target_token = token_down
+                # Reset circuit breaker if cooldown expired
+                if circuit_breaker_active:
+                    circuit_breaker_active = False
+                    circuit_breaker_until = 0.0
 
-                # Fetch orderbook for target
-                ob = await fetch_orderbook(session, target_token)
-                ask_price = ob["ask_price"]
-                ask_size = ob["ask_size"]
-
-                if ask_price == 0:
-                    decision = "SKIP_NO_ASKS"
-                    order_simulated = True
-                elif ask_price > MAX_BUY_PRICE:
-                    decision = "SKIP_EXPENSIVE"
-                    buy_price = ask_price
-                    order_simulated = True
-                elif ask_price < MIN_BUY_PRICE:
-                    decision = "SKIP_CHEAP"
-                    buy_price = ask_price
-                    order_simulated = True
-                elif ask_size * ask_price < MIN_ASK_SIZE_USD:
-                    decision = "SKIP_THIN_BOOK"
-                    buy_price = ask_price
+                if decision_delta == 0:
+                    decision = "SKIP_FLAT"
                     order_simulated = True
                 else:
-                    decision = f"BUY_{target_side}"
-                    side_bought = target_side
-                    buy_price = ask_price
-                    order_simulated = True
+                    # Determine direction
+                    if decision_delta > 0:
+                        target_side = "UP"
+                        target_token = token_up
+                    else:
+                        target_side = "DOWN"
+                        target_token = token_down
+
+                    # Fetch orderbook for target
+                    ob = await fetch_orderbook(session, target_token)
+                    ask_price = ob["ask_price"]
+                    ask_size = ob["ask_size"]
+
+                    if ask_price == 0:
+                        decision = "SKIP_NO_ASKS"
+                        order_simulated = True
+                    elif ask_price > MAX_BUY_PRICE:
+                        decision = "SKIP_EXPENSIVE"
+                        buy_price = ask_price
+                        order_simulated = True
+                    elif ask_price < MIN_BUY_PRICE:
+                        decision = "SKIP_CHEAP"
+                        buy_price = ask_price
+                        order_simulated = True
+                    elif ask_size * ask_price < MIN_ASK_SIZE_USD:
+                        decision = "SKIP_THIN_BOOK"
+                        buy_price = ask_price
+                        order_simulated = True
+                    else:
+                        decision = f"BUY_{target_side}"
+                        side_bought = target_side
+                        buy_price = ask_price
+                        order_simulated = True
 
             # Update phase after decision
             update_ui(
@@ -785,6 +834,8 @@ def print_final_report(stats: Stats):
 
 async def main(max_candles: int | None = None):
     """Run frequent momentum paper trader across multiple candles."""
+    global bot_start_time
+    bot_start_time = time.time()
     session = create_session()
     shutdown = asyncio.Event()
     price_task = asyncio.create_task(btc_price_stream(session))
