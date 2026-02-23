@@ -560,6 +560,7 @@ async def simulate_candle(
     Phase 3 (T+15s – close): QUOTING — monitor for fill
     Phase 4 (close): SETTLE — calculate P&L
     """
+    global circuit_breaker_active, circuit_breaker_until
     event_start = market["event_start"]
     event_end = market["event_end"]
     token_up = market["token_up_id"]
