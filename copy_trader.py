@@ -644,8 +644,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--poll-interval", "-p",
         type=int,
-        default=5,
-        help="Seconds between API polls (default: 5)",
+        default=1,
+        help="Seconds between API polls (default: 1)",
     )
     args = parser.parse_args()
 
