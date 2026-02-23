@@ -51,14 +51,15 @@ from perf import (
 STARTING_BALANCE = 10.00
 MAX_BUY_PRICE = 0.60          # Don't bid higher than this per side
 MIN_BUY_PRICE = 0.10          # Don't bid lower than this
-MAX_COMBINED_COST = 0.96      # Max total cost for UP+DOWN (must be < 1.00)
-MAX_TRADE_USD = 5.0           # Max simulated order size PER SIDE
+MAX_COMBINED_COST = 0.92      # Max total cost for UP+DOWN (must be < 1.00)
+MAX_TRADE_USD = 1.50          # Max simulated order size PER SIDE
+BET_FRACTION = 0.10           # Bet this fraction of balance per side
 MIN_ASK_SIZE_USD = 5.0
 MAX_SPREAD = 0.08             # Max spread per side
 TICK_SIZE = 0.01
 
 # Two-sided quoting parameters
-HALF_SPREAD = 0.02            # Quote this far from fair value on each side
+HALF_SPREAD = 0.05            # Quote this far from fair value on each side
 SKEW_STEP = 0.01              # Skew quotes by this much when one side fills
 REQUOTE_THRESHOLD = 0.02      # Requote if fair value moves by this much
 
@@ -84,7 +85,7 @@ CLOB_HOST = "https://clob.polymarket.com"
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 COINCAP_URL = "https://api.coincap.io/v2/assets/bitcoin"
 
-CSV_FILE = "csv_logs/paper_trades_maker_two.csv"
+CSV_FILE = "csv_logs/paper_trades_maker_two_v2.csv"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -138,12 +139,11 @@ def calc_quotes(p_up: float, half_spread: float, skew: float = 0.0):
     down_bid = max(MIN_BUY_PRICE, min(MAX_BUY_PRICE, round(down_bid / TICK_SIZE) * TICK_SIZE))
 
     # Ensure combined cost stays profitable
-    if up_bid + down_bid >= MAX_COMBINED_COST:
-        excess = (up_bid + down_bid) - MAX_COMBINED_COST + TICK_SIZE
-        up_bid -= excess / 2
-        down_bid -= excess / 2
-        up_bid = round(up_bid / TICK_SIZE) * TICK_SIZE
-        down_bid = round(down_bid / TICK_SIZE) * TICK_SIZE
+    while up_bid + down_bid >= MAX_COMBINED_COST:
+        up_bid -= TICK_SIZE
+        down_bid -= TICK_SIZE
+        up_bid = max(MIN_BUY_PRICE, round(up_bid / TICK_SIZE) * TICK_SIZE)
+        down_bid = max(MIN_BUY_PRICE, round(down_bid / TICK_SIZE) * TICK_SIZE)
 
     return up_bid, down_bid
 
@@ -751,15 +751,16 @@ async def simulate_candle(
                 if down_best_ask > 0 and down_bid >= down_best_ask:
                     down_bid = down_best_ask - TICK_SIZE
 
-                if up_bid < MIN_BUY_PRICE and down_bid < MIN_BUY_PRICE:
-                    decision = "SKIP_BIDS_TOO_LOW"
-                    quoting_started = True
-                elif up_bid + down_bid >= 1.0:
+                # CRITICAL: Enforce combined cost invariant AFTER ask-capping
+                if up_bid + down_bid >= MAX_COMBINED_COST:
                     decision = "SKIP_NO_EDGE"
+                    quoting_started = True
+                elif up_bid < MIN_BUY_PRICE and down_bid < MIN_BUY_PRICE:
+                    decision = "SKIP_BIDS_TOO_LOW"
                     quoting_started = True
                 else:
                     effective_bal = min(stats.balance, STARTING_BALANCE)
-                    bid_size_usd = min(MAX_TRADE_USD, effective_bal / 2)
+                    bid_size_usd = min(MAX_TRADE_USD, effective_bal * BET_FRACTION)
                     decision = "QUOTE_BOTH"
                     quoting_started = True
                     quote_time = time.time()
@@ -783,7 +784,8 @@ async def simulate_candle(
                         current_skew = -SKEW_STEP  # Raise DOWN bid
                         _, down_bid_new = calc_quotes(current_fair_value, HALF_SPREAD, current_skew)
                         if down_best_ask > 0 and down_bid_new < down_best_ask:
-                            down_bid = down_bid_new
+                            if up_bid + down_bid_new < MAX_COMBINED_COST:
+                                down_bid = down_bid_new
 
             # Check DOWN fill
             if not down_filled:
@@ -796,7 +798,8 @@ async def simulate_candle(
                         current_skew = SKEW_STEP  # Raise UP bid
                         up_bid_new, _ = calc_quotes(current_fair_value, HALF_SPREAD, current_skew)
                         if up_best_ask > 0 and up_bid_new < up_best_ask:
-                            up_bid = up_bid_new
+                            if up_bid_new + down_bid < MAX_COMBINED_COST:
+                                up_bid = up_bid_new
 
             # Requote only if BTC price actually changed since last fair value calc
             cur_btc = btc_price
@@ -806,9 +809,11 @@ async def simulate_candle(
                     current_fair_value = new_fv
                     new_up, new_down = calc_quotes(current_fair_value, HALF_SPREAD, current_skew)
                     if not up_filled and up_best_ask > 0 and new_up < up_best_ask:
-                        up_bid = new_up
+                        if new_up + down_bid < MAX_COMBINED_COST:
+                            up_bid = new_up
                     if not down_filled and down_best_ask > 0 and new_down < down_best_ask:
-                        down_bid = new_down
+                        if up_bid + new_down < MAX_COMBINED_COST:
+                            down_bid = new_down
                 last_fv_btc = cur_btc
 
             # Phase 4: CANCEL remaining orders near close

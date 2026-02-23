@@ -49,13 +49,18 @@ from perf import (
 # ─────────────────────────────────────────────────────────────
 
 STARTING_BALANCE = 10.00
-MAX_BUY_PRICE = 0.95          # Don't bid higher than this
+MAX_BUY_PRICE = 0.55          # Don't bid higher than this (near 50/50)
 MIN_BUY_PRICE = 0.10          # Don't bid lower than this
-SAFE_BUFFER_USD = 20.0        # BTC must move this far from open to predict
-MAX_TRADE_USD = 5.0           # Max simulated order size
+SAFE_BUFFER_USD = 30.0        # BTC must move this far from open to predict
+MAX_TRADE_USD = 2.0           # Max simulated order size
+BET_FRACTION = 0.15           # Bet 15% of balance max
 MIN_ASK_SIZE_USD = 5.0        # Minimum depth required
 MAX_SPREAD = 0.05             # Max spread to consider market healthy
 TICK_SIZE = 0.01              # Minimum price increment
+
+# Circuit breaker
+CIRCUIT_BREAKER_LOSSES = 3    # Consecutive losses to trigger cooldown
+CIRCUIT_BREAKER_COOLDOWN = 1800  # 30 minute cooldown (seconds)
 
 # Maker-specific
 BID_OFFSET = 0.01             # Bid at best_bid + this (front of queue)
@@ -75,7 +80,7 @@ CLOB_HOST = "https://clob.polymarket.com"
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 COINCAP_URL = "https://api.coincap.io/v2/assets/bitcoin"
 
-CSV_FILE = "csv_logs/paper_trades_maker_one.csv"
+CSV_FILE = "csv_logs/paper_trades_maker_one_v2.csv"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -86,6 +91,10 @@ btc_price: float = 0.0
 btc_price_updated: float = 0.0
 price_feed_status: str = "connecting"
 bot_start_time: float = time.time()
+
+# Circuit breaker state
+circuit_breaker_active: bool = False
+circuit_breaker_until: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -615,6 +624,9 @@ async def simulate_candle(
             if stale_age > PRICE_STALE_RECONNECT:
                 decision = "SKIP_STALE_PRICE"
                 decision_made = True
+            elif circuit_breaker_active and time.time() < circuit_breaker_until:
+                decision = "SKIP_COOLDOWN"
+                decision_made = True
             elif abs_delta < SAFE_BUFFER_USD:
                 decision = "SKIP_RISKY"
                 decision_made = True
@@ -655,8 +667,13 @@ async def simulate_candle(
                         decision = "SKIP_BID_TOO_LOW"
                         decision_made = True
                     else:
+                        # Reset circuit breaker if cooldown expired
+                        if circuit_breaker_active:
+                            circuit_breaker_active = False
+                            circuit_breaker_until = 0.0
+
                         effective_bal = min(stats.balance, STARTING_BALANCE)
-                        bid_size_usd = min(MAX_TRADE_USD, effective_bal)
+                        bid_size_usd = min(MAX_TRADE_USD, effective_bal * BET_FRACTION)
                         decision = f"QUOTE_{predicted_direction}"
                         decision_made = True
                         decision_time = time.time()
@@ -841,6 +858,13 @@ async def main():
             trade = await simulate_candle(session, market, candle_num, stats)
             stats.record(trade)
             log_trade_csv(CSV_FILE, trade, stats)
+
+            # Circuit breaker: trigger on consecutive losses
+            if (trade.filled and not trade.won
+                    and stats.current_streak <= -CIRCUIT_BREAKER_LOSSES
+                    and not circuit_breaker_active):
+                circuit_breaker_active = True
+                circuit_breaker_until = time.time() + CIRCUIT_BREAKER_COOLDOWN
 
             if args.candles > 0 and candle_num >= args.candles:
                 break

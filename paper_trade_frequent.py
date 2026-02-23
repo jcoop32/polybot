@@ -47,10 +47,12 @@ from perf import (
 # ─────────────────────────────────────────────────────────────
 
 STARTING_BALANCE = 10.00       # Starting paper bankroll
-MAX_BUY_PRICE = 0.60           # Willing to pay more (early candle prices ~0.50-0.55)
+MAX_BUY_PRICE = 0.52           # Only buy near 50/50 odds
 MIN_BUY_PRICE = 0.10           # Don't buy below this (phantom liquidity)
-MAX_TRADE_USD = 5.0            # Simulated trade size per candle
+MAX_TRADE_USD = 2.0            # Max trade size per candle
+BET_FRACTION = 0.15            # Bet 15% of balance max
 MIN_ASK_SIZE_USD = 2.0         # Lowered to ensure frequent fills
+MIN_DELTA_USD = 30.0           # Require $30+ BTC move for signal
 DECISION_SECOND = 15           # Make the decision at T+15s into the 300s candle
 
 # Circuit breaker
@@ -65,7 +67,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 COINCAP_URL = "https://api.coincap.io/v2/assets/bitcoin"
 
-CSV_FILE = "csv_logs/paper_trades_frequent_v3.csv"
+CSV_FILE = "csv_logs/paper_trades_frequent_v4.csv"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -633,7 +635,10 @@ async def simulate_candle(
                     circuit_breaker_active = False
                     circuit_breaker_until = 0.0
 
-                if decision_delta == 0:
+                if abs(decision_delta) < MIN_DELTA_USD:
+                    decision = "SKIP_WEAK_SIGNAL"
+                    order_simulated = True
+                elif decision_delta == 0:
                     decision = "SKIP_FLAT"
                     order_simulated = True
                 else:
@@ -707,7 +712,7 @@ async def simulate_candle(
     taker_fee = 0.0
 
     if decision.startswith("BUY"):
-        bet_amount = min(MAX_TRADE_USD, stats.balance)
+        bet_amount = min(MAX_TRADE_USD, stats.balance * BET_FRACTION)
         shares = bet_amount / buy_price if buy_price > 0 else 0
 
         # Dynamic taker fee based on buy price (= probability)
