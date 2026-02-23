@@ -224,8 +224,8 @@ def build_screen(state: dict) -> str:
     w(f"  {B}│{R}  📋 {B}PAPER COPY TRADER{R}"
       f"                  {D}Simulated{R}    {B}│{R}\n")
 
-    # Show pseudonym if known
-    label = pseudonym if pseudonym else f"{wallet[:20]}...{wallet[-6:]}"
+    # Show wallet address
+    label = f"{wallet[:20]}...{wallet[-6:]}"
     pad = max(1, 55 - len(label))
     w(f"  {B}│{R}  {D}👁️  {label}{R}{' ' * pad}{B}│{R}\n")
     w(f"  {B}├{'─' * 62}┤{R}\n")
