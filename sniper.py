@@ -39,6 +39,8 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
+from perf import calc_taker_fee, fetch_fee_rate
+
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
@@ -463,22 +465,37 @@ async def trading_loop():
                         # ── Phase 2: EXECUTION ──
                         if remaining <= TRADE_TIME_WINDOW and not order_fired:
                             if ask_p > 0 and ask_p <= MAX_BUY_PRICE:
+                                # Calculate fee and check if trade is still profitable
+                                fee_rate = calc_taker_fee(ask_p)
+                                fee_pct = fee_rate * 100
                                 profit = ((1.0 / ask_p) - 1) * 100
-                                log.info(
-                                    f"[{secs_left:>3}s left] {emoji} BTC Safe "
-                                    f"(${btc_price:,.2f} vs open ${candle_open_price:,.2f}). "
-                                    f"Winning: {side}. Best Ask: ${ask_p:.4f}. "
-                                    f"Profit: {profit:.1f}%. -> 🔥 FIRING BUY!"
-                                )
-                                try:
-                                    result = fire_fok_order(
-                                        client, winning_token, MAX_TRADE_USD
+                                net_profit = profit - fee_pct
+                                
+                                if net_profit <= 0:
+                                    log.info(
+                                        f"[{secs_left:>3}s left] {emoji} BTC Safe "
+                                        f"(${btc_price:,.2f} vs open ${candle_open_price:,.2f}). "
+                                        f"Winning: {side}. Best Ask: ${ask_p:.4f}. "
+                                        f"Profit: {profit:.1f}% - Fee: {fee_pct:.2f}% = "
+                                        f"Net: {net_profit:.2f}% -> ⏸️ FEE EXCEEDS EDGE"
                                     )
-                                    order_fired = True
-                                    log.info(f"✅ ORDER PLACED: {result}")
-                                except Exception as e:
-                                    log.error(f"❌ ORDER FAILED: {e}")
-                                    order_fired = True  # Don't retry on same candle
+                                else:
+                                    log.info(
+                                        f"[{secs_left:>3}s left] {emoji} BTC Safe "
+                                        f"(${btc_price:,.2f} vs open ${candle_open_price:,.2f}). "
+                                        f"Winning: {side}. Best Ask: ${ask_p:.4f}. "
+                                        f"Profit: {profit:.1f}% - Fee: {fee_pct:.2f}% = "
+                                        f"Net: {net_profit:.1f}%. -> 🔥 FIRING BUY!"
+                                    )
+                                    try:
+                                        result = fire_fok_order(
+                                            client, winning_token, MAX_TRADE_USD
+                                        )
+                                        order_fired = True
+                                        log.info(f"✅ ORDER PLACED: {result}")
+                                    except Exception as e:
+                                        log.error(f"❌ ORDER FAILED: {e}")
+                                        order_fired = True  # Don't retry on same candle
                             elif ask_p > MAX_BUY_PRICE:
                                 log.info(
                                     f"[{secs_left:>3}s left] {emoji} BTC Safe "

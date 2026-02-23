@@ -190,6 +190,59 @@ async def fetch_orderbook_rest(
 
 
 # ─────────────────────────────────────────────────────────────
+# DYNAMIC TAKER FEE (Jan 2026 — crypto markets)
+# ─────────────────────────────────────────────────────────────
+#
+# Formula: fee = C × 0.25 × (p × (1-p))²
+# Max fee: ~1.5625% at p=0.50, drops to near 0% at extremes.
+# Makers pay ZERO fees. This only applies to taker orders.
+#
+
+FEE_CONSTANT_C = 1.0  # Polymarket's multiplier constant
+
+
+def calc_taker_fee(probability: float) -> float:
+    """
+    Calculate the dynamic taker fee as a fraction (0.0–0.015625).
+
+    Args:
+        probability: Market probability (0.0–1.0), i.e. the ask price.
+
+    Returns:
+        Fee as a decimal fraction (e.g. 0.015625 = 1.5625%).
+    """
+    p = max(0.0, min(1.0, probability))
+    return FEE_CONSTANT_C * 0.25 * (p * (1 - p)) ** 2
+
+
+def calc_taker_fee_bps(probability: float) -> int:
+    """Return the taker fee in basis points (for feeRateBps field)."""
+    return round(calc_taker_fee(probability) * 10_000)
+
+
+async def fetch_fee_rate(
+    session: aiohttp.ClientSession, token_id: str
+) -> int:
+    """
+    Query the live fee rate from the CLOB for a specific token.
+    Returns feeRateBps (int). Falls back to calc_taker_fee_bps if API fails.
+    """
+    try:
+        url = f"{CLOB_HOST}/fee-rate"
+        params = {"tokenID": token_id}
+        async with session.get(
+            url, params=params, timeout=aiohttp.ClientTimeout(total=3)
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return int(data.get("feeRateBps", data.get("fee_rate_bps", 0)))
+    except Exception:
+        pass
+    # Fallback: estimate from midpoint probability
+    return calc_taker_fee_bps(0.5)
+
+
+# ─────────────────────────────────────────────────────────────
 # DECOUPLED UI RENDERER
 # ─────────────────────────────────────────────────────────────
 

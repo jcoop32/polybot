@@ -36,6 +36,7 @@ from perf import (
     json_loads, json_dumps, create_session,
     orderbook_ws_stream, get_cached_orderbook, fetch_orderbook_rest,
     update_ui, ui_renderer, adaptive_sleep_early,
+    calc_taker_fee,
 )
 
 
@@ -87,7 +88,7 @@ BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 COINCAP_URL = "https://api.coincap.io/v2/assets/bitcoin"
 
-CSV_FILE = "paper_trades_indicator.csv"
+CSV_FILE = "csv_logs/paper_trades_indicator.csv"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -143,6 +144,7 @@ class Trade:
     won: bool
     pnl: float
     pnl_pct: float
+    taker_fee: float = 0.0
     balance_after: float
     # Orderbook context
     ask_size: float = 0.0
@@ -573,7 +575,8 @@ def init_csv(path: str):
                 "candle_start", "candle_end",
                 "btc_open", "btc_close", "btc_delta",
                 "actual_direction", "decision", "side_bought",
-                "buy_price", "bet_amount", "won", "pnl", "pnl_pct",
+                "buy_price", "bet_amount", "won", "taker_fee",
+                "pnl", "pnl_pct",
                 "cumulative_pnl", "balance", "win_rate",
                 # Indicator columns
                 "rsi", "ema_signal", "macd_signal", "bb_signal",
@@ -601,6 +604,7 @@ def log_trade_csv(path: str, trade: Trade, stats: Stats):
             f"{trade.buy_price:.4f}",
             f"{trade.bet_amount:.2f}",
             trade.won,
+            f"{trade.taker_fee:.4f}",
             f"{trade.pnl:.4f}",
             f"{trade.pnl_pct:.2f}",
             f"{stats.total_pnl:.4f}",
@@ -662,7 +666,7 @@ def print_trade_result(trade: Trade):
               f"({'+' if trade.delta >= 0 else ''}${trade.delta:,.2f})")
         print(f"     Direction: {trade.actual_direction} | Bought: {trade.side_bought} "
               f"@ ${trade.buy_price:.4f}")
-        print(f"     Bet: ${trade.bet_amount:.2f}  |  "
+        print(f"     Bet: ${trade.bet_amount:.2f}  |  Fee: ${trade.taker_fee:.4f}  |  "
               f"P&L: {c}{sign}${trade.pnl:.4f}{R} ({sign}{trade.pnl_pct:.1f}%)")
         bal_c = GREEN if trade.balance_after >= STARTING_BALANCE else RED
         print(f"     Balance: {bal_c}${trade.balance_after:.4f}{R}")
@@ -826,6 +830,7 @@ def print_waiting(market: dict, remaining: float, candle_open: float, stats: Sta
             print(f"  │ Side:       Bought {B}{lt.side_bought}{R} @ "
                   f"${lt.buy_price:.4f}  →  Actual: {lt.actual_direction}")
             print(f"  │ Bet:        ${lt.bet_amount:.2f}  │  "
+                  f"Fee: {YELLOW}${lt.taker_fee:.4f}{R}  │  "
                   f"P&L: {result_c}{pnl_sign}${lt.pnl:.4f}{R} "
                   f"({result_c}{pnl_sign}{lt.pnl_pct:.1f}%{R})")
             print(f"  │ Indicators: RSI={lt.rsi_value:.1f}  consensus={lt.consensus_score:+d}")
@@ -957,6 +962,7 @@ def build_screen(state: dict) -> str:
             pnl_sign = "+" if lt.pnl >= 0 else ""
             w(f"  │ Result: {result_c}{B}{'✅ WON' if lt.won else '❌ LOST'}{R}\n")
             w(f"  │ Bet: ${lt.bet_amount:.2f}  │  "
+              f"Fee: {YELLOW}${lt.taker_fee:.4f}{R}  │  "
               f"P&L: {result_c}{pnl_sign}${lt.pnl:.4f}{R}\n")
         else:
             reason = lt.decision.replace("SKIP_", "")
@@ -1165,6 +1171,7 @@ async def simulate_candle(
     pnl = 0.0
     pnl_pct = 0.0
     bet_amount = 0.0
+    taker_fee = 0.0
 
     if decision.startswith("BUY"):
         effective_bal = min(stats.balance, STARTING_BALANCE)
@@ -1172,14 +1179,18 @@ async def simulate_candle(
         bet_amount = min(MAX_TRADE_USD * sizing_mult, effective_bal)
         shares = bet_amount / buy_price if buy_price > 0 else 0
 
+        # Dynamic taker fee based on buy price (= probability)
+        fee_rate = calc_taker_fee(buy_price)
+        taker_fee = bet_amount * fee_rate
+
         if side_bought == actual_direction:
             payout = shares * 1.0
-            pnl = payout - bet_amount
+            pnl = payout - bet_amount - taker_fee
             pnl_pct = (pnl / bet_amount) * 100
             won = True
         else:
-            pnl = -bet_amount
-            pnl_pct = -100.0
+            pnl = -bet_amount - taker_fee
+            pnl_pct = (pnl / bet_amount) * 100
             won = False
 
     btc_volatility = btc_high - btc_low if btc_low < float('inf') else 0.0
@@ -1202,6 +1213,7 @@ async def simulate_candle(
         won=won,
         pnl=pnl,
         pnl_pct=pnl_pct,
+        taker_fee=taker_fee,
         balance_after=balance_after,
         ask_size=ask_size,
         book_depth_usd=book_depth_usd,

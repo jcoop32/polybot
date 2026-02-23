@@ -38,6 +38,7 @@ from perf import (
     json_loads, create_session,
     orderbook_ws_stream, fetch_orderbook_rest, get_cached_orderbook,
     update_ui, ui_renderer,
+    calc_taker_fee,
 )
 
 
@@ -64,7 +65,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 COINCAP_URL = "https://api.coincap.io/v2/assets/bitcoin"
 
-CSV_FILE = "paper_trades_frequent_v2.csv"
+CSV_FILE = "csv_logs/paper_trades_frequent_v3.csv"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -102,6 +103,7 @@ class Trade:
     won: bool
     pnl: float                  # Profit/loss for this trade
     pnl_pct: float              # P&L as percentage
+    taker_fee: float = 0.0             # Dynamic taker fee deducted
     balance_after: float = 0.0
     decision_btc_price: float = 0.0    # BTC price at moment of decision
     decision_delta: float = 0.0        # Delta at moment of decision (T+15s)
@@ -332,7 +334,8 @@ def init_csv(path: str):
                 "candle_num", "timestamp", "slug", "title",
                 "btc_open", "btc_close", "btc_delta",
                 "actual_direction", "decision", "side_bought",
-                "buy_price", "bet_amount", "won", "pnl", "pnl_pct",
+                "buy_price", "bet_amount", "won", "taker_fee",
+                "pnl", "pnl_pct",
                 "cumulative_pnl", "balance", "win_rate",
                 "decision_btc_price", "decision_delta",
             ])
@@ -356,6 +359,7 @@ def log_trade_csv(path: str, trade: Trade, stats: Stats):
             f"{trade.buy_price:.4f}",
             f"{trade.bet_amount:.2f}",
             trade.won,
+            f"{trade.taker_fee:.4f}",
             f"{trade.pnl:.4f}",
             f"{trade.pnl_pct:.2f}",
             f"{stats.total_pnl:.4f}",
@@ -517,6 +521,7 @@ def build_screen(state: dict) -> str:
             w(f"  │ Side:       Bought {B}{lt.side_bought}{R} @ "
               f"${lt.buy_price:.4f}  →  Actual: {lt.actual_direction}\n")
             w(f"  │ Bet:        ${lt.bet_amount:.2f}  │  "
+              f"Fee: {YELLOW}${lt.taker_fee:.4f}{R}  │  "
               f"P&L: {result_c}{pnl_sign}${lt.pnl:.4f}{R} "
               f"({result_c}{pnl_sign}{lt.pnl_pct:.1f}%{R})\n")
             w(f"  │ BTC Move:   ${lt.open_price:,.2f} → ${lt.close_price:,.2f} "
@@ -710,19 +715,24 @@ async def simulate_candle(
     won = False
     pnl = 0.0
     pnl_pct = 0.0
+    taker_fee = 0.0
 
     if decision.startswith("BUY"):
         bet_amount = min(MAX_TRADE_USD, stats.balance)
         shares = bet_amount / buy_price if buy_price > 0 else 0
 
+        # Dynamic taker fee based on buy price (= probability)
+        fee_rate = calc_taker_fee(buy_price)
+        taker_fee = bet_amount * fee_rate
+
         if side_bought == actual_direction:
             payout = shares * 1.0
-            pnl = payout - bet_amount
+            pnl = payout - bet_amount - taker_fee
             pnl_pct = (pnl / bet_amount) * 100
             won = True
         else:
-            pnl = -bet_amount
-            pnl_pct = -100.0
+            pnl = -bet_amount - taker_fee
+            pnl_pct = ((pnl) / bet_amount) * 100
             won = False
 
     balance_after = stats.balance + pnl
@@ -742,6 +752,7 @@ async def simulate_candle(
         won=won,
         pnl=pnl,
         pnl_pct=pnl_pct,
+        taker_fee=taker_fee,
         balance_after=balance_after,
         decision_btc_price=decision_btc_price,
         decision_delta=decision_delta,
