@@ -94,6 +94,7 @@ CSV_FILE = "csv_logs/paper_trades_maker_two.csv"
 btc_price: float = 0.0
 btc_price_updated: float = 0.0
 price_feed_status: str = "connecting"
+bot_start_time: float = time.time()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -476,6 +477,18 @@ def format_countdown(seconds: float) -> str:
     return f"{m}m {s:02d}s" if m > 0 else f"{s}s"
 
 
+def format_uptime(start: float) -> str:
+    elapsed = int(time.time() - start)
+    h = elapsed // 3600
+    m = (elapsed % 3600) // 60
+    s = elapsed % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    elif m > 0:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
 def build_screen(state: dict) -> str:
     buf = io.StringIO()
     w = buf.write
@@ -498,134 +511,138 @@ def build_screen(state: dict) -> str:
     delta = btc_price - candle_open if candle_open > 0 else 0
     delta_sign = "+" if delta >= 0 else ""
     dir_c = GREEN if delta >= 0 else RED
-    direction = "UP 📈" if delta >= 0 else "DOWN 📉"
+    direction = "▲ UP" if delta >= 0 else "▼ DN"
 
     bal_c = GREEN if stats.balance >= STARTING_BALANCE else RED
+    pnl_c = GREEN if stats.total_pnl >= 0 else RED
+    pnl_s = "+" if stats.total_pnl >= 0 else ""
 
-    w(f"{B}{'═' * 64}{R}\n")
-    w(f"{B}  🏦 MAKER BOT — TWO-SIDED PAPER TRADING{R}\n")
-    w(f"{B}{'═' * 64}{R}\n")
-    w(f"  {D}{market['title']}{R}\n")
-    w(f"  💰 Balance: {bal_c}{B}${stats.balance:.4f}{R}\n")
-    w("\n")
+    # ── Header ──
+    w(f"  {B}┌{'─' * 62}┐{R}\n")
+    w(f"  {B}│{R}  🏦 {B}MAKER — TWO-SIDED{R}"
+      f"                  {D}Paper Trading{R}   {B}│{R}\n")
+    w(f"  {B}│{R}  {D}{market['title']:<60}{R}{B}│{R}\n")
+    w(f"  {B}├{'─' * 62}┤{R}\n")
+    uptime_str = format_uptime(bot_start_time)
+    w(f"  {B}│{R}  💰 {bal_c}{B}${stats.balance:.4f}{R}"
+      f"                    🕐 {uptime_str}"
+      f"{' ' * max(1, 22 - len(uptime_str))}{B}│{R}\n")
+    w(f"  {B}└{'─' * 62}┘{R}\n")
 
-    # Timer
-    if to_start > 0:
-        w(f"  ⏳ Candle starts in {B}{format_countdown(to_start)}{R}\n")
-    else:
-        bar_len = 30
-        filled_bars = max(0, int((remaining / CANDLE_SECONDS) * bar_len))
-        bar = "█" * filled_bars + "░" * (bar_len - filled_bars)
-        cd = format_countdown(remaining)
-        w(f"  ⏱️  Remaining: {B}{cd}{R}  [{bar}]\n")
-
-    # BTC
-    w("\n")
+    # ── BTC Price ──
     stale_age = time.time() - btc_price_updated if btc_price_updated > 0 else 0
-    stale_warn = f"  {RED}⚠️  {int(stale_age)}s stale!{R}" if stale_age > PRICE_STALE_SECONDS else ""
-    feed_icon = f"{GREEN}🟢 WS{R}" if price_feed_status == "ws_live" else (
-        f"{YELLOW}🟡 HTTP{R}" if price_feed_status == "http_fallback" else f"{RED}🔴{R}")
-    w(f"  ₿ BTC:  {B}${btc_price:>12,.2f}{R}  {feed_icon}{stale_warn}\n")
+    if price_feed_status == "ws_live":
+        feed = f"{GREEN}●{R}"
+    elif price_feed_status == "http_fallback":
+        feed = f"{YELLOW}●{R}"
+    else:
+        feed = f"{RED}●{R}"
+    stale_tag = f"  {RED}⚠ {int(stale_age)}s stale{R}" if stale_age > PRICE_STALE_SECONDS else ""
+    w(f"\n  {feed} BTC  {B}${btc_price:>12,.2f}{R}{stale_tag}\n")
     if candle_open > 0:
-        w(f"  📌 Open: ${candle_open:>12,.2f}    "
-          f"Delta: {dir_c}{delta_sign}${delta:>10,.2f}{R}  {dir_c}{direction}{R}\n")
+        w(f"    Open ${candle_open:>12,.2f}    "
+          f"Δ {dir_c}{B}{delta_sign}${abs(delta):,.2f}{R}  {dir_c}{direction}{R}\n")
 
-    # Phase
-    w("\n")
+    # ── Candle Timer ──
+    if to_start > 0:
+        w(f"\n  ⏳ Starts in {B}{format_countdown(to_start)}{R}\n")
+    else:
+        bar_len = 40
+        filled = max(0, int((elapsed / CANDLE_SECONDS) * bar_len))
+        bar = f"{CYAN}{'━' * filled}{R}{D}{'╌' * (bar_len - filled)}{R}"
+        w(f"\n  [{bar}] {B}{format_countdown(remaining)}{R} {D}T+{int(elapsed)}s{R}\n")
+
+    # ── Phase / Quote Status ──
     qi = quote_info
     if phase == "OBSERVING":
-        w(f"  🔭 {CYAN}OBSERVING — Quoting starts at T+{QUOTE_START_SECOND}s{R}\n")
+        secs_left = max(0, QUOTE_START_SECOND - elapsed)
+        w(f"  {MAGENTA}🔬 Observing ({int(secs_left)}s to quote){R}\n")
     elif phase == "QUOTING":
         fv = qi.get("fair_value", 0.5)
-        w(f"  📊 {B}Fair Value: P(UP)={fv:.2f}  P(DN)={1-fv:.2f}{R}\n")
-        w("\n")
-
-        # UP quote status
         up_bid = qi.get("up_bid", 0)
-        up_filled = qi.get("up_filled", False)
-        up_ask = qi.get("up_ask", 0)
-        up_icon = f"{GREEN}✅ FILLED{R}" if up_filled else f"{YELLOW}⏳ open{R}"
-        w(f"  │ UP   bid: ${up_bid:.2f}  {up_icon}")
-        if not up_filled and up_ask > 0:
-            w(f"  (ask: ${up_ask:.2f})")
-        w("\n")
-
-        # DOWN quote status
         dn_bid = qi.get("down_bid", 0)
+        up_filled = qi.get("up_filled", False)
         dn_filled = qi.get("down_filled", False)
+        up_ask = qi.get("up_ask", 0)
         dn_ask = qi.get("down_ask", 0)
-        dn_icon = f"{GREEN}✅ FILLED{R}" if dn_filled else f"{YELLOW}⏳ open{R}"
-        w(f"  │ DOWN bid: ${dn_bid:.2f}  {dn_icon}")
+
+        w(f"  {D}FV: P(UP)={fv:.2f}  P(DN)={1-fv:.2f}{R}\n")
+
+        # Compact two-line quote display
+        up_stat = f"{GREEN}✓{R}" if up_filled else f"{YELLOW}○{R}"
+        dn_stat = f"{GREEN}✓{R}" if dn_filled else f"{YELLOW}○{R}"
+        w(f"  {up_stat} UP  @${up_bid:.2f}")
+        if not up_filled and up_ask > 0:
+            w(f"  {D}ask ${up_ask:.2f}{R}")
+        w(f"     {dn_stat} DN  @${dn_bid:.2f}")
         if not dn_filled and dn_ask > 0:
-            w(f"  (ask: ${dn_ask:.2f})")
+            w(f"  {D}ask ${dn_ask:.2f}{R}")
         w("\n")
 
-        # Combined status
+        # Spread profit line
         combined = up_bid + dn_bid
         spread_profit = 1.0 - combined
-        w(f"  │ Combined: ${combined:.2f}  → "
-          f"Spread profit if both fill: {GREEN}${spread_profit:.4f}{R}\n")
+        w(f"  {D}Combined ${combined:.2f}  →  "
+          f"Spread {GREEN}+${spread_profit:.4f}{R}\n")
 
         if up_filled and dn_filled:
-            w(f"\n  🎉 {GREEN}{B}BOTH SIDES FILLED! Locked profit.{R}\n")
+            w(f"  {GREEN}{B}🎉 BOTH FILLED — Locked profit{R}\n")
         elif up_filled or dn_filled:
-            side = "UP" if up_filled else "DOWN"
-            w(f"\n  ⚠️  {YELLOW}Only {side} filled — directional exposure{R}\n")
+            side = "UP" if up_filled else "DN"
+            w(f"  {YELLOW}⚠ Only {side} filled — directional{R}\n")
     elif phase == "CANCELLED":
-        w(f"  🛑 {D}Orders cancelled — waiting for candle close{R}\n")
+        w(f"  {D}🛑 Cancelled — waiting for close{R}\n")
+    elif phase == "SKIPPED":
+        w(f"  {YELLOW}🚫 Skipped{R}\n")
     else:
-        w(f"  🎯 {D}{phase}{R}\n")
+        w(f"  {D}{phase}{R}\n")
 
-    # Session stats
+    # ── Stats Grid ──
     if stats.total_candles > 0:
-        pnl_c = GREEN if stats.total_pnl >= 0 else RED
-        pnl_s = "+" if stats.total_pnl >= 0 else ""
-        w("\n")
-        w(f"  {D}─── Session: {stats.total_quotes} quoted | "
-          f"Both: {stats.both_fills} | "
-          f"One: {stats.up_only_fills + stats.down_only_fills} | "
-          f"None: {stats.no_fills} | "
-          f"P&L: {pnl_s}${stats.total_pnl:.4f} ───{R}\n")
+        one_fills = stats.up_only_fills + stats.down_only_fills
+        w(f"\n  {D}{'─' * 62}{R}\n")
+        w(f"  Quoted {B}{stats.total_quotes}{R}"
+          f"  │  Both {GREEN}{stats.both_fills}{R}"
+          f"  One {YELLOW}{one_fills}{R}"
+          f"  None {D}{stats.no_fills}{R}"
+          f"  │  P&L {pnl_c}{B}{pnl_s}${stats.total_pnl:.4f}{R}\n")
+        if stats.total_rebates > 0:
+            w(f"  {D}Rebates: {GREEN}+${stats.total_rebates:.4f}{R}"
+              f"  {D}│  Net: {pnl_c}{pnl_s}${stats.total_pnl + stats.total_rebates:.4f}{R}\n")
+        w(f"  {D}{'─' * 62}{R}\n")
 
-    # Last trade
+    # ── Last Trade ──
     if stats.trades:
         lt = stats.trades[-1]
-        w("\n")
-        w(f"  {B}{'─' * 64}{R}\n")
-        w(f"  {B}📋 LAST CANDLE (#{lt.candle_num}){R}\n")
-        w(f"  {B}{'─' * 64}{R}\n")
 
         if lt.decision.startswith("QUOTE"):
             if lt.both_filled:
-                w(f"  │ Result:     {GREEN}{B}🎉 BOTH FILLED — LOCKED PROFIT{R}\n")
-                w(f"  │ UP bid:     ${lt.up_bid:.4f} ✅  │  DOWN bid: ${lt.down_bid:.4f} ✅\n")
-                w(f"  │ Cost:       ${lt.total_cost:.4f}  →  Payout: $1.00  →  "
-                  f"Profit: {GREEN}+${lt.locked_profit:.4f}{R}\n")
+                w(f"\n  {D}Last #{lt.candle_num}{R}  "
+                  f"{GREEN}{B}BOTH{R}  "
+                  f"UP@${lt.up_bid:.2f} + DN@${lt.down_bid:.2f}"
+                  f"  = ${lt.total_cost:.2f}"
+                  f"  →  {GREEN}+${lt.locked_profit:.4f}{R}\n")
             elif lt.single_side:
                 result_c = GREEN if lt.pnl >= 0 else RED
-                result_icon = "✅ WON" if lt.pnl >= 0 else "❌ LOST"
+                result_tag = f"{result_c}{B}{'WIN' if lt.pnl >= 0 else 'LOSS'}{R}"
                 pnl_sign = "+" if lt.pnl >= 0 else ""
-                w(f"  │ Result:     {result_c}{B}{result_icon}{R}  "
-                  f"(only {lt.single_side} filled)\n")
-                filled_price = lt.up_bid if lt.single_side == "UP" else lt.down_bid
-                w(f"  │ Filled:     {B}{lt.single_side}{R} @ ${filled_price:.4f}  "
-                  f"→  Actual: {lt.actual_direction}\n")
-                w(f"  │ P&L:        {result_c}{pnl_sign}${lt.pnl:.4f}{R}  │  "
-                  f"Rebate: {GREEN}+${lt.maker_rebate:.4f}{R}\n")
+                filled_p = lt.up_bid if lt.single_side == "UP" else lt.down_bid
+                w(f"\n  {D}Last #{lt.candle_num}{R}  {result_tag}  "
+                  f"Only {B}{lt.single_side}{R}@${filled_p:.2f}"
+                  f"  →  {lt.actual_direction}"
+                  f"  {result_c}{pnl_sign}${lt.pnl:.4f}{R}"
+                  f"  {D}Rebate +${lt.maker_rebate:.4f}{R}\n")
             else:
-                w(f"  │ Result:     {YELLOW}NO FILLS{R}  "
-                  f"(UP ask: ${lt.up_best_ask:.4f}, DOWN ask: ${lt.down_best_ask:.4f})\n")
+                w(f"\n  {D}Last #{lt.candle_num}  {YELLOW}NO FILLS{R}"
+                  f" {D}UP ask ${lt.up_best_ask:.2f}  DN ask ${lt.down_best_ask:.2f}{R}\n")
         else:
             reason = lt.decision.replace("SKIP_", "")
-            w(f"  │ Decision:   {YELLOW}SKIPPED — {reason}{R}\n")
+            w(f"\n  {D}Last #{lt.candle_num}  {YELLOW}SKIP{R} {D}({reason}){R}\n")
 
-        w(f"  │ BTC Move:   ${lt.open_price:,.2f} → ${lt.close_price:,.2f} "
-          f"({'+'if lt.delta >= 0 else ''}${lt.delta:,.2f})\n")
-        w(f"  {B}{'─' * 64}{R}\n")
+        w(f"  {D}BTC ${lt.open_price:,.0f}→${lt.close_price:,.0f}"
+          f"  ({'+' if lt.delta >= 0 else ''}${lt.delta:,.0f}){R}\n")
 
-    w("\n")
-    w(f"  {D}Ctrl+C to stop and see final report{R}\n")
-    w(f"{B}{'═' * 64}{R}\n")
+    w(f"\n  {D}Ctrl+C for report{R}\n")
 
     return buf.getvalue()
 

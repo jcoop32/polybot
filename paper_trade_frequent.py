@@ -428,117 +428,106 @@ def build_screen(state: dict) -> str:
     delta = btc_price - candle_open if candle_open > 0 else 0
     delta_sign = "+" if delta >= 0 else ""
     dir_c = GREEN if delta >= 0 else RED
-    direction = "UP 📈" if delta >= 0 else "DOWN 📉"
+    direction = "▲ UP" if delta >= 0 else "▼ DN"
 
     bal_c = GREEN if stats.balance >= STARTING_BALANCE else RED
     bet_size = min(MAX_TRADE_USD, stats.balance)
+    pnl_c = GREEN if stats.total_pnl >= 0 else RED
+    pnl_s = "+" if stats.total_pnl >= 0 else ""
 
     # ── Header ──
-    w(f"{B}{'═' * 64}{R}\n")
-    w(f"{B}  ⚡ FREQUENT MOMENTUM TRADER — PAPER{R}\n")
-    w(f"{B}{'═' * 64}{R}\n")
-    w(f"  {D}{market['title']}{R}\n")
-    w(f"  💰 Balance: {bal_c}{B}${stats.balance:.4f}{R}  "
-      f"│  Next bet: ${bet_size:.2f}  "
-      f"│  🕐 Uptime: {B}{format_uptime(bot_start_time)}{R}\n")
-    w("\n")
+    w(f"  {B}┌{'─' * 62}┐{R}\n")
+    w(f"  {B}│{R}  ⚡ {B}FREQUENT MOMENTUM TRADER{R}"
+      f"           {D}Paper Trading{R}   {B}│{R}\n")
+    w(f"  {B}│{R}  {D}{market['title']:<60}{R}{B}│{R}\n")
+    w(f"  {B}├{'─' * 62}┤{R}\n")
+    uptime_str = format_uptime(bot_start_time)
+    w(f"  {B}│{R}  💰 {bal_c}{B}${stats.balance:.4f}{R}"
+      f"     Bet: ${bet_size:.2f}"
+      f"     🕐 {uptime_str}"
+      f"{' ' * max(1, 22 - len(uptime_str))}{B}│{R}\n")
+    w(f"  {B}└{'─' * 62}┘{R}\n")
 
-    # ── Timer ──
-    if to_start > 0:
-        w(f"  ⏳ Candle starts in {B}{format_countdown(to_start)}{R}\n")
-    else:
-        bar_len = 30
-        filled = max(0, int((elapsed / 300) * bar_len))
-        bar = "█" * filled + "░" * (bar_len - filled)
-        cd = format_countdown(remaining)
-        w(f"  ⏱️  Remaining: {B}{cd}{R}  [{bar}]  "
-          f"{D}T+{int(elapsed)}s{R}\n")
-
-    w("\n")
-
-    # ── Price feed status ──
+    # ── BTC Price ──
     stale_age = time.time() - btc_price_updated if btc_price_updated > 0 else 0
-    stale_warn = (f"  {RED}⚠️  Price data is {int(stale_age)}s stale!{R}"
-                  if stale_age > PRICE_STALE_SECONDS else "")
     if price_feed_status == "ws_live":
-        feed_icon = f"{GREEN}🟢 WS Live{R}"
+        feed = f"{GREEN}●{R}"
     elif price_feed_status == "http_fallback":
-        feed_icon = f"{YELLOW}🟡 HTTP Fallback{R}"
+        feed = f"{YELLOW}●{R}"
     else:
-        feed_icon = f"{RED}🔴 {price_feed_status.upper()}{R}"
-    w(f"  ₿ BTC:  {B}${btc_price:>12,.2f}{R}  {feed_icon}{stale_warn}\n")
-
+        feed = f"{RED}●{R}"
+    stale_tag = f"  {RED}⚠ {int(stale_age)}s stale{R}" if stale_age > PRICE_STALE_SECONDS else ""
+    w(f"\n  {feed} BTC  {B}${btc_price:>12,.2f}{R}{stale_tag}\n")
     if candle_open > 0:
-        w(f"  📌 Open: ${candle_open:>12,.2f}    "
-          f"Delta: {dir_c}{delta_sign}${delta:>10,.2f}{R}    "
-          f"{dir_c}{direction}{R}\n")
+        w(f"    Open ${candle_open:>12,.2f}    "
+          f"Δ {dir_c}{B}{delta_sign}${abs(delta):,.2f}{R}  {dir_c}{direction}{R}\n")
 
-    # ── Phase indicator ──
+    # ── Candle Timer ──
+    if to_start > 0:
+        w(f"\n  ⏳ Starts in {B}{format_countdown(to_start)}{R}\n")
+    else:
+        bar_len = 40
+        filled = max(0, int((elapsed / 300) * bar_len))
+        bar = f"{CYAN}{'━' * filled}{R}{D}{'╌' * (bar_len - filled)}{R}"
+        w(f"\n  [{bar}] {B}{format_countdown(remaining)}{R} {D}T+{int(elapsed)}s{R}\n")
+
+    # ── Phase ──
     if phase == "waiting":
-        phase_str = f"{CYAN}⏳ Waiting to open{R}"
+        phase_str = f"{CYAN}⏳ Waiting{R}"
     elif phase == "measuring":
         secs_left = max(0, DECISION_SECOND - elapsed)
-        phase_str = f"{MAGENTA}🔬 Measuring momentum... ({int(secs_left)}s to decision){R}"
+        phase_str = f"{MAGENTA}🔬 Measuring ({int(secs_left)}s to decision){R}"
     elif phase == "monitoring":
         decision_label = state.get("decision", "")
         if decision_label.startswith("BUY"):
             side = decision_label.replace("BUY_", "")
-            phase_str = f"{GREEN}📡 Bought {side} — monitoring candle{R}"
+            phase_str = f"{GREEN}📡 Bought {side} — monitoring{R}"
         else:
-            phase_str = f"{YELLOW}🚫 No trade — monitoring candle{R}"
+            phase_str = f"{YELLOW}🚫 Skipped — monitoring{R}"
     else:
         phase_str = f"{D}—{R}"
-    w(f"  🎯 {phase_str}\n")
-
-    # ── Circuit breaker status ──
+    w(f"  {phase_str}")
     if circuit_breaker_active:
         cb_remaining = max(0, circuit_breaker_until - time.time())
-        cb_mins = int(cb_remaining) // 60
-        cb_secs = int(cb_remaining) % 60
-        w(f"  {RED}🔌 CIRCUIT BREAKER — Cooling down ({cb_mins}m {cb_secs:02d}s remaining){R}\n")
+        w(f"  {RED}🔌 Cooldown {int(cb_remaining)}s{R}")
+    w("\n")
 
-    # ── Session summary ──
+    # ── Stats Grid ──
     if stats.total_candles > 0:
-        pnl_c = GREEN if stats.total_pnl >= 0 else RED
-        pnl_s = "+" if stats.total_pnl >= 0 else ""
-        w("\n")
-        w(f"  {D}─── Session: {stats.total_trades} trades | "
-          f"{stats.win_rate:.0f}% win rate | "
-          f"P&L: {pnl_s}${stats.total_pnl:.4f} ───{R}\n")
+        wr = stats.win_rate
+        wr_c = GREEN if wr >= 50 else YELLOW
+        w(f"\n  {D}{'─' * 62}{R}\n")
+        w(f"  Trades {B}{stats.total_trades}{R}"
+          f"  │  W{GREEN} {stats.wins}{R} L{RED} {stats.losses}{R}"
+          f"  │  WR {wr_c}{B}{wr:.0f}%{R}"
+          f"  │  P&L {pnl_c}{B}{pnl_s}${stats.total_pnl:.4f}{R}\n")
+        w(f"  {D}{'─' * 62}{R}\n")
 
-    # ── Last Trade Recap ──
+    # ── Last Trade ──
     if stats.trades:
         lt = stats.trades[-1]
-        w("\n")
-        w(f"  {B}{'─' * 64}{R}\n")
-        w(f"  {B}📋 LAST TRADE (Candle #{lt.candle_num}){R}\n")
-        w(f"  {B}{'─' * 64}{R}\n")
+
         if lt.decision.startswith("BUY"):
             result_c = GREEN if lt.won else RED
-            result_icon = "✅ WON" if lt.won else "❌ LOST"
+            result_tag = f"{result_c}{B}{'WIN' if lt.won else 'LOSS'}{R}"
             pnl_sign = "+" if lt.pnl >= 0 else ""
-            w(f"  │ Result:     {result_c}{B}{result_icon}{R}\n")
-            w(f"  │ Side:       Bought {B}{lt.side_bought}{R} @ "
-              f"${lt.buy_price:.4f}  →  Actual: {lt.actual_direction}\n")
-            w(f"  │ Bet:        ${lt.bet_amount:.2f}  │  "
-              f"Fee: {YELLOW}${lt.taker_fee:.4f}{R}  │  "
-              f"P&L: {result_c}{pnl_sign}${lt.pnl:.4f}{R} "
-              f"({result_c}{pnl_sign}{lt.pnl_pct:.1f}%{R})\n")
-            w(f"  │ BTC Move:   ${lt.open_price:,.2f} → ${lt.close_price:,.2f} "
-              f"({'+' if lt.delta >= 0 else ''}${lt.delta:,.2f})\n")
-            w(f"  │ Decision:   At T+{DECISION_SECOND}s, BTC "
-              f"${lt.decision_btc_price:,.2f}, delta "
-              f"{'+' if lt.decision_delta >= 0 else ''}${lt.decision_delta:,.2f}\n")
+            w(f"\n  {D}Last #{lt.candle_num}{R}  {result_tag}  "
+              f"Bought {B}{lt.side_bought}{R}@${lt.buy_price:.2f}"
+              f"  →  {lt.actual_direction}"
+              f"  {result_c}{pnl_sign}${lt.pnl:.4f}{R} "
+              f"{D}({pnl_sign}{lt.pnl_pct:.1f}%){R}\n")
+            w(f"  {D}${lt.bet_amount:.2f} bet  "
+              f"Fee ${lt.taker_fee:.4f}  "
+              f"BTC ${lt.open_price:,.0f}→${lt.close_price:,.0f} "
+              f"({'+' if lt.delta >= 0 else ''}${lt.delta:,.0f})  "
+              f"@T+{DECISION_SECOND}s Δ{'+' if lt.decision_delta >= 0 else ''}"
+              f"${lt.decision_delta:,.0f}{R}\n")
         else:
             reason = lt.decision.replace("SKIP_", "")
-            w(f"  │ Decision:   {YELLOW}SKIPPED — {reason}{R}\n")
-            w(f"  │ BTC Move:   ${lt.open_price:,.2f} → ${lt.close_price:,.2f} "
-              f"({'+' if lt.delta >= 0 else ''}${lt.delta:,.2f})\n")
-        w(f"  {B}{'─' * 64}{R}\n")
+            w(f"\n  {D}Last #{lt.candle_num}  {YELLOW}SKIP{R} {D}({reason})"
+              f"  BTC ${lt.open_price:,.0f}→${lt.close_price:,.0f}{R}\n")
 
-    w("\n")
-    w(f"  {D}Ctrl+C to stop and see final report{R}\n")
-    w(f"{B}{'═' * 64}{R}\n")
+    w(f"\n  {D}Ctrl+C for report{R}\n")
 
     return buf.getvalue()
 

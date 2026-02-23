@@ -85,6 +85,7 @@ CSV_FILE = "csv_logs/paper_trades_maker_one.csv"
 btc_price: float = 0.0
 btc_price_updated: float = 0.0
 price_feed_status: str = "connecting"
+bot_start_time: float = time.time()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -393,6 +394,18 @@ def format_countdown(seconds: float) -> str:
     return f"{m}m {s:02d}s" if m > 0 else f"{s}s"
 
 
+def format_uptime(start: float) -> str:
+    elapsed = int(time.time() - start)
+    h = elapsed // 3600
+    m = (elapsed % 3600) // 60
+    s = elapsed % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    elif m > 0:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
 def build_screen(state: dict) -> str:
     """Build the dashboard for the UI renderer."""
     buf = io.StringIO()
@@ -416,113 +429,106 @@ def build_screen(state: dict) -> str:
     delta = btc_price - candle_open if candle_open > 0 else 0
     delta_sign = "+" if delta >= 0 else ""
     dir_c = GREEN if delta >= 0 else RED
-    direction = "UP 📈" if delta >= 0 else "DOWN 📉"
+    direction = "▲ UP" if delta >= 0 else "▼ DN"
 
     bal_c = GREEN if stats.balance >= STARTING_BALANCE else RED
     bet_size = min(MAX_TRADE_USD, stats.balance)
+    pnl_c = GREEN if stats.total_pnl >= 0 else RED
+    pnl_s = "+" if stats.total_pnl >= 0 else ""
 
-    w(f"{B}{'═' * 64}{R}\n")
-    w(f"{B}  🏦 MAKER BOT — ONE-SIDED PAPER TRADING{R}\n")
-    w(f"{B}{'═' * 64}{R}\n")
-    w(f"  {D}{market['title']}{R}\n")
-    w(f"  💰 Balance: {bal_c}{B}${stats.balance:.4f}{R}  "
-      f"│  Next bid: ${bet_size:.2f}\n")
-    w("\n")
+    # ── Header ──
+    w(f"  {B}┌{'─' * 62}┐{R}\n")
+    w(f"  {B}│{R}  🏦 {B}MAKER — ONE-SIDED{R}"
+      f"                  {D}Paper Trading{R}   {B}│{R}\n")
+    w(f"  {B}│{R}  {D}{market['title']:<60}{R}{B}│{R}\n")
+    w(f"  {B}├{'─' * 62}┤{R}\n")
+    uptime_str = format_uptime(bot_start_time)
+    w(f"  {B}│{R}  💰 {bal_c}{B}${stats.balance:.4f}{R}"
+      f"     Bid: ${bet_size:.2f}"
+      f"     🕐 {uptime_str}"
+      f"{' ' * max(1, 22 - len(uptime_str))}{B}│{R}\n")
+    w(f"  {B}└{'─' * 62}┘{R}\n")
 
-    # Candle timer
-    if to_start > 0:
-        w(f"  ⏳ Candle starts in {B}{format_countdown(to_start)}{R}\n")
-    else:
-        bar_len = 30
-        filled = max(0, int((remaining / CANDLE_SECONDS) * bar_len))
-        bar = "█" * filled + "░" * (bar_len - filled)
-        cd = format_countdown(remaining)
-        w(f"  ⏱️  Remaining: {B}{cd}{R}  [{bar}]\n")
-
-    w("\n")
-    # BTC price
+    # ── BTC Price ──
     stale_age = time.time() - btc_price_updated if btc_price_updated > 0 else 0
-    stale_warn = f"  {RED}⚠️  {int(stale_age)}s stale!{R}" if stale_age > PRICE_STALE_SECONDS else ""
     if price_feed_status == "ws_live":
-        feed_icon = f"{GREEN}🟢 WS{R}"
+        feed = f"{GREEN}●{R}"
     elif price_feed_status == "http_fallback":
-        feed_icon = f"{YELLOW}🟡 HTTP{R}"
+        feed = f"{YELLOW}●{R}"
     else:
-        feed_icon = f"{RED}🔴 {price_feed_status.upper()}{R}"
-    w(f"  ₿ BTC:  {B}${btc_price:>12,.2f}{R}  {feed_icon}{stale_warn}\n")
+        feed = f"{RED}●{R}"
+    stale_tag = f"  {RED}⚠ {int(stale_age)}s stale{R}" if stale_age > PRICE_STALE_SECONDS else ""
+    w(f"\n  {feed} BTC  {B}${btc_price:>12,.2f}{R}{stale_tag}\n")
     if candle_open > 0:
-        w(f"  📌 Open: ${candle_open:>12,.2f}    "
-          f"Delta: {dir_c}{delta_sign}${delta:>10,.2f}{R}    "
-          f"{dir_c}{direction}{R}\n")
+        w(f"    Open ${candle_open:>12,.2f}    "
+          f"Δ {dir_c}{B}{delta_sign}${abs(delta):,.2f}{R}  {dir_c}{direction}{R}\n")
 
-    # Phase indicator
-    w("\n")
+    # ── Candle Timer ──
+    if to_start > 0:
+        w(f"\n  ⏳ Starts in {B}{format_countdown(to_start)}{R}\n")
+    else:
+        bar_len = 40
+        filled = max(0, int((elapsed / CANDLE_SECONDS) * bar_len))
+        bar = f"{CYAN}{'━' * filled}{R}{D}{'╌' * (bar_len - filled)}{R}"
+        w(f"\n  [{bar}] {B}{format_countdown(remaining)}{R} {D}T+{int(elapsed)}s{R}\n")
+
+    # ── Phase / Quote Status ──
     if phase == "OBSERVING":
-        w(f"  🔭 {CYAN}OBSERVING — Decision at T+{DECISION_SECOND}s "
-          f"({max(0, DECISION_SECOND - elapsed):.0f}s left){R}\n")
+        secs_left = max(0, DECISION_SECOND - elapsed)
+        w(f"  {MAGENTA}🔬 Observing ({int(secs_left)}s to decision){R}\n")
     elif phase == "QUOTING":
         qi = quote_info
-        w(f"  📋 {YELLOW}QUOTING {qi.get('side', '?')}{R} "
-          f"@ ${qi.get('bid_price', 0):.4f}  "
-          f"(spread: ${qi.get('spread', 0):.4f})\n")
+        bid_p = qi.get("bid_price", 0)
+        side = qi.get("side", "?")
+        cur_ask = qi.get("current_ask", 0)
         if qi.get("filled"):
-            w(f"  ✅ {GREEN}FILLED!{R}  Waiting for candle close...\n")
+            w(f"  {GREEN}✅ FILLED{R}  Bid {B}{side}{R}@${bid_p:.2f}  — waiting for close\n")
         else:
-            w(f"  ⏳ Waiting for fill... "
-              f"(ask: ${qi.get('current_ask', 0):.4f}, need ≤ ${qi.get('bid_price', 0):.4f})\n")
-    elif phase == "SETTLED":
-        w(f"  📊 {D}Candle settled — see last trade below{R}\n")
+            w(f"  {YELLOW}📋 BID {side}{R}@${bid_p:.2f}"
+              f"  {D}ask: ${cur_ask:.2f}  need ≤${bid_p:.2f}{R}\n")
+    elif phase == "SKIPPED":
+        w(f"  {YELLOW}🚫 Skipped — monitoring{R}\n")
     else:
-        w(f"  🎯 {D}{phase}{R}\n")
+        w(f"  {D}{phase}{R}\n")
 
-    # Session stats
+    # ── Stats Grid ──
     if stats.total_candles > 0:
-        pnl_c = GREEN if stats.total_pnl >= 0 else RED
-        pnl_s = "+" if stats.total_pnl >= 0 else ""
-        w("\n")
-        w(f"  {D}─── Session: {stats.total_quotes} quotes | "
-          f"{stats.fill_rate:.0f}% fill rate | "
-          f"{stats.total_fills} fills | "
-          f"P&L: {pnl_s}${stats.total_pnl:.4f} ───{R}\n")
+        w(f"\n  {D}{'─' * 62}{R}\n")
+        w(f"  Quotes {B}{stats.total_quotes}{R}"
+          f"  │  Fills {B}{stats.total_fills}{R}"
+          f"  │  Rate {B}{stats.fill_rate:.0f}%{R}"
+          f"  │  P&L {pnl_c}{B}{pnl_s}${stats.total_pnl:.4f}{R}\n")
         if stats.total_rebates > 0:
-            w(f"  {D}    Rebates earned: {GREEN}+${stats.total_rebates:.4f}{R}\n")
+            w(f"  {D}Rebates: {GREEN}+${stats.total_rebates:.4f}{R}"
+              f"  {D}│  Net: {pnl_c}{pnl_s}${stats.total_pnl + stats.total_rebates:.4f}{R}\n")
+        w(f"  {D}{'─' * 62}{R}\n")
 
-    # Last trade
+    # ── Last Trade ──
     if stats.trades:
         lt = stats.trades[-1]
-        w("\n")
-        w(f"  {B}{'─' * 64}{R}\n")
-        w(f"  {B}📋 LAST CANDLE (#{lt.candle_num}){R}\n")
-        w(f"  {B}{'─' * 64}{R}\n")
 
         if lt.decision.startswith("QUOTE"):
             if lt.filled:
                 result_c = GREEN if lt.won else RED
-                result_icon = "✅ WON" if lt.won else "❌ LOST"
+                result_tag = f"{result_c}{B}{'WIN' if lt.won else 'LOSS'}{R}"
                 pnl_sign = "+" if lt.pnl >= 0 else ""
-                w(f"  │ Result:     {result_c}{B}{result_icon}{R}  (FILLED)\n")
-                w(f"  │ Side:       Bid {B}{lt.predicted_direction}{R} "
-                  f"@ ${lt.bid_price:.4f}  →  Actual: {lt.actual_direction}\n")
-                w(f"  │ Bet:        ${lt.bid_size_usd:.2f}  │  "
-                  f"P&L: {result_c}{pnl_sign}${lt.pnl:.4f}{R}  │  "
-                  f"Rebate: {GREEN}+${lt.maker_rebate:.4f}{R}\n")
+                w(f"\n  {D}Last #{lt.candle_num}{R}  {result_tag}  "
+                  f"Bid {B}{lt.predicted_direction}{R}@${lt.bid_price:.2f}"
+                  f"  →  {lt.actual_direction}"
+                  f"  {result_c}{pnl_sign}${lt.pnl:.4f}{R}"
+                  f"  {D}Rebate +${lt.maker_rebate:.4f}{R}\n")
             else:
-                w(f"  │ Result:     {YELLOW}NOT FILLED{R}\n")
-                w(f"  │ Side:       Bid {B}{lt.predicted_direction}{R} "
-                  f"@ ${lt.bid_price:.4f}  (ask never reached)\n")
-                w(f"  │ Spread:     ${lt.spread:.4f}  "
-                  f"(bid: ${lt.best_bid:.4f}, ask: ${lt.best_ask:.4f})\n")
+                w(f"\n  {D}Last #{lt.candle_num}  {YELLOW}NO FILL{R}"
+                  f" {D}Bid {lt.predicted_direction}@${lt.bid_price:.2f}"
+                  f"  spread ${lt.spread:.2f}{R}\n")
         else:
             reason = lt.decision.replace("SKIP_", "")
-            w(f"  │ Decision:   {YELLOW}SKIPPED — {reason}{R}\n")
+            w(f"\n  {D}Last #{lt.candle_num}  {YELLOW}SKIP{R} {D}({reason}){R}\n")
 
-        w(f"  │ BTC Move:   ${lt.open_price:,.2f} → ${lt.close_price:,.2f} "
-          f"({'+'if lt.delta >= 0 else ''}${lt.delta:,.2f})\n")
-        w(f"  {B}{'─' * 64}{R}\n")
+        w(f"  {D}BTC ${lt.open_price:,.0f}→${lt.close_price:,.0f}"
+          f"  ({'+' if lt.delta >= 0 else ''}${lt.delta:,.0f}){R}\n")
 
-    w("\n")
-    w(f"  {D}Ctrl+C to stop and see final report{R}\n")
-    w(f"{B}{'═' * 64}{R}\n")
+    w(f"\n  {D}Ctrl+C for report{R}\n")
 
     return buf.getvalue()
 
