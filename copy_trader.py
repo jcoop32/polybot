@@ -2,8 +2,8 @@
 """
 Paper Copy Trader — Watch a Polymarket wallet and simulate copying its trades.
 
-Connects to the Polymarket live data WebSocket, subscribes to a target wallet's
-trade channel, and paper-trades every detected BUY/SELL. No real orders are placed.
+Polls the Polymarket Data API for a target wallet's recent trades and
+paper-trades every new BUY/SELL detected. No real orders are placed.
 
 Usage:
     python copy_trader.py --wallet 0xTargetAddress
@@ -23,11 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
-import websockets
 
 from perf import (
     create_session,
-    fetch_orderbook_rest,
     update_ui,
     ui_renderer,
     calc_taker_fee,
@@ -37,17 +35,23 @@ from perf import (
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
-LIVE_DATA_WS = "wss://ws-live-data.polymarket.com"
-CLOB_HOST = "https://clob.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
-CSV_FILE = "csv_logs/paper_copy_trades.csv"
+
+def csv_path_for_wallet(wallet: str) -> str:
+    """Generate a per-wallet CSV filename."""
+    short = wallet[:6] + "..." + wallet[-4:]
+    return f"csv_logs/paper_copy_{short}.csv"
+POLL_INTERVAL = 1  # seconds between polls
 
 # ─────────────────────────────────────────────────────────────
 # SHARED STATE
 # ─────────────────────────────────────────────────────────────
 
 bot_start_time: float = time.time()
-ws_status: str = "connecting"
+feed_status: str = "starting"
+last_poll_time: float = 0.0
+polls_completed: int = 0
 
 # ─────────────────────────────────────────────────────────────
 # DATA CLASSES
@@ -59,23 +63,28 @@ class Trade:
     trade_id: str
     timestamp: str
     token_id: str
-    market_title: str        # resolved from Gamma API if possible
+    market_title: str
+    slug: str
     side: str                # BUY or SELL
-    fill_price: float        # best ask/bid at time of detection
-    amount: float            # paper amount wagered
+    outcome: str             # Up, Down, Yes, No, etc.
+    original_price: float    # price the target trader paid
+    original_size_usd: float # how much they wagered
+    paper_amount: float      # our paper bet
     taker_fee: float
-    pnl: float               # immediate estimated P&L (on sell) or 0 (on buy)
+    pnl: float
     balance_after: float
 
 @dataclass
 class PaperPosition:
     """An open paper position."""
     token_id: str
-    side: str                # always BUY
+    side: str
     entry_price: float
     amount: float
     shares: float
     market_title: str
+    slug: str
+    outcome: str
     opened_at: str
 
 @dataclass
@@ -84,7 +93,7 @@ class Stats:
     balance: float = 100.0
     starting_balance: float = 100.0
     trades: list[Trade] = field(default_factory=list)
-    total_trades: int = 0
+    total_copied: int = 0
     buys: int = 0
     sells: int = 0
     realized_pnl: float = 0.0
@@ -111,34 +120,6 @@ class Stats:
 
 
 # ─────────────────────────────────────────────────────────────
-# MARKET TITLE RESOLUTION
-# ─────────────────────────────────────────────────────────────
-
-_title_cache: dict[str, str] = {}
-
-async def resolve_market_title(session: aiohttp.ClientSession, token_id: str) -> str:
-    """Try to resolve a token_id to a human-readable market title via Gamma API."""
-    if token_id in _title_cache:
-        return _title_cache[token_id]
-
-    try:
-        url = f"{GAMMA_API}/markets?clob_token_ids={token_id}"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data and len(data) > 0:
-                    title = data[0].get("question", data[0].get("title", token_id[:16]))
-                    _title_cache[token_id] = title
-                    return title
-    except Exception:
-        pass
-
-    short = f"...{token_id[-8:]}"
-    _title_cache[token_id] = short
-    return short
-
-
-# ─────────────────────────────────────────────────────────────
 # CSV LOGGING
 # ─────────────────────────────────────────────────────────────
 
@@ -150,9 +131,11 @@ def init_csv(path: str):
             writer = csv.writer(f)
             writer.writerow([
                 "trade_id", "timestamp", "token_id", "market_title",
-                "side", "fill_price", "amount", "taker_fee",
+                "slug", "side", "outcome",
+                "original_price", "original_size_usd",
+                "paper_amount", "taker_fee",
                 "pnl", "balance_after",
-                "cumulative_pnl", "total_trades", "win_rate",
+                "cumulative_pnl", "total_copied", "win_rate",
             ])
 
 
@@ -165,14 +148,17 @@ def log_trade_csv(path: str, trade: Trade, stats: Stats):
             trade.timestamp,
             trade.token_id[:16],
             trade.market_title,
+            trade.slug,
             trade.side,
-            f"{trade.fill_price:.4f}",
-            f"{trade.amount:.2f}",
+            trade.outcome,
+            f"{trade.original_price:.4f}",
+            f"{trade.original_size_usd:.2f}",
+            f"{trade.paper_amount:.2f}",
             f"{trade.taker_fee:.4f}",
             f"{trade.pnl:.4f}",
             f"{trade.balance_after:.4f}",
             f"{stats.realized_pnl:.4f}",
-            stats.total_trades,
+            stats.total_copied,
             f"{stats.win_rate:.1f}",
         ])
 
@@ -211,6 +197,7 @@ def build_screen(state: dict) -> str:
 
     stats: Stats | None = state.get("stats")
     wallet: str = state.get("wallet", "")
+    pseudonym: str = state.get("pseudonym", "")
     positions: dict = state.get("positions", {})
     trade_amount: float = state.get("trade_amount", 5.0)
 
@@ -222,19 +209,25 @@ def build_screen(state: dict) -> str:
     pnl_s = "+" if stats.realized_pnl >= 0 else ""
 
     # Status indicator
-    if ws_status == "connected":
+    if feed_status == "polling":
         status_dot = f"{GREEN}●{R}"
-    elif ws_status == "reconnecting":
+        status_text = "POLLING"
+    elif feed_status == "starting":
         status_dot = f"{YELLOW}●{R}"
+        status_text = "STARTING"
     else:
         status_dot = f"{RED}●{R}"
+        status_text = "ERROR"
 
     # ── Header ──
     w(f"  {B}┌{'─' * 62}┐{R}\n")
     w(f"  {B}│{R}  📋 {B}PAPER COPY TRADER{R}"
       f"                  {D}Simulated{R}    {B}│{R}\n")
-    w(f"  {B}│{R}  {D}Watching: {wallet[:20]}...{wallet[-6:]}{R}"
-      f"{' ' * max(1, 30 - len(wallet[:20]))}{B}│{R}\n")
+
+    # Show pseudonym if known
+    label = pseudonym if pseudonym else f"{wallet[:20]}...{wallet[-6:]}"
+    pad = max(1, 55 - len(label))
+    w(f"  {B}│{R}  {D}👁️  {label}{R}{' ' * pad}{B}│{R}\n")
     w(f"  {B}├{'─' * 62}┤{R}\n")
     uptime_str = format_uptime(bot_start_time)
     w(f"  {B}│{R}  💰 {bal_c}{B}${stats.balance:.4f}{R}"
@@ -243,27 +236,31 @@ def build_screen(state: dict) -> str:
       f"{' ' * max(1, 22 - len(uptime_str))}{B}│{R}\n")
     w(f"  {B}└{'─' * 62}┘{R}\n")
 
-    # ── Connection Status ──
-    w(f"\n  {status_dot} WebSocket  {B}{ws_status.upper()}{R}\n")
+    # ── Feed Status ──
+    age = int(time.time() - last_poll_time) if last_poll_time > 0 else 0
+    w(f"\n  {status_dot} {status_text}  "
+      f"{D}(every {POLL_INTERVAL}s · last {age}s ago · #{polls_completed}){R}\n")
 
     # ── Open Positions ──
     if positions:
         w(f"\n  {B}Open Positions ({len(positions)}){R}\n")
         w(f"  {D}{'─' * 62}{R}\n")
         for tid, pos in list(positions.items())[:5]:
-            w(f"  {CYAN}►{R} {pos.market_title[:40]}\n")
+            w(f"  {CYAN}►{R} {pos.market_title[:45]}\n")
             w(f"    {D}Entry ${pos.entry_price:.4f}  "
-              f"Shares {pos.shares:.2f}  "
+              f"{pos.outcome}  "
               f"${pos.amount:.2f}{R}\n")
+        if len(positions) > 5:
+            w(f"  {D}... and {len(positions) - 5} more{R}\n")
     else:
         w(f"\n  {D}No open positions{R}\n")
 
     # ── Stats Grid ──
-    if stats.total_trades > 0:
+    if stats.total_copied > 0:
         wr = stats.win_rate
         wr_c = GREEN if wr >= 50 else YELLOW
         w(f"\n  {D}{'─' * 62}{R}\n")
-        w(f"  Trades {B}{stats.total_trades}{R}"
+        w(f"  Copied {B}{stats.total_copied}{R}"
           f"  │  Buys {CYAN}{stats.buys}{R}"
           f"  Sells {MAGENTA}{stats.sells}{R}"
           f"  │  P&L {pnl_c}{B}{pnl_s}${stats.realized_pnl:.4f}{R}\n")
@@ -277,17 +274,19 @@ def build_screen(state: dict) -> str:
     # ── Recent Trades ──
     if stats.trades:
         w(f"\n  {B}Recent Trades{R}\n")
-        for t in stats.trades[-5:]:
+        for t in stats.trades[-6:]:
             side_c = GREEN if t.side == "BUY" else MAGENTA
             pnl_str = ""
             if t.pnl != 0:
                 tc = GREEN if t.pnl > 0 else RED
                 ps = "+" if t.pnl > 0 else ""
                 pnl_str = f"  {tc}{ps}${t.pnl:.4f}{R}"
+            title_short = t.market_title[:30] if len(t.market_title) > 30 else t.market_title
             w(f"  {side_c}{t.side:>4}{R}  "
-              f"${t.fill_price:.4f}  "
-              f"${t.amount:.2f}  "
-              f"{t.market_title[:30]}"
+              f"${t.original_price:.2f}  "
+              f"${t.paper_amount:.2f}  "
+              f"{t.outcome:>5}  "
+              f"{title_short}"
               f"{pnl_str}\n")
 
     w(f"\n  {D}Ctrl+C for report{R}\n")
@@ -296,70 +295,67 @@ def build_screen(state: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# PAPER TRADE EXECUTION
+# PAPER TRADE PROCESSING
 # ─────────────────────────────────────────────────────────────
 
-async def paper_execute(
-    session: aiohttp.ClientSession,
-    trade_id: str,
-    token_id: str,
-    side: str,
+def process_trade(
+    activity: dict,
     stats: Stats,
     positions: dict,
     trade_amount: float,
-):
-    """Simulate a copied trade using current orderbook prices."""
-    global ws_status
+) -> Trade | None:
+    """Process a single activity event from the Data API into a paper trade."""
 
-    timestamp = datetime.now(timezone.utc).isoformat()
-    market_title = await resolve_market_title(session, token_id)
-
-    # Fetch current orderbook for realistic fill price
-    ob = await fetch_orderbook_rest(session, token_id)
-    fill_price = ob["ask_price"] if side == "BUY" else ob["bid_price"]
-
-    # If we can't get a price, use a fallback
-    if fill_price <= 0:
-        fill_price = 0.50  # assume 50/50
+    tx_hash = activity.get("transactionHash", "")
+    token_id = activity.get("asset", "")
+    side = activity.get("side", "BUY").upper()
+    price = float(activity.get("price", 0.5))
+    usdc_size = float(activity.get("usdcSize", 0))
+    title = activity.get("title", "Unknown Market")
+    slug = activity.get("slug", "")
+    outcome = activity.get("outcome", "")
+    timestamp = activity.get("timestamp", 0)
+    ts_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat() if timestamp else ""
 
     pnl = 0.0
     taker_fee = 0.0
-    amount = 0.0
+    paper_amount = 0.0
 
     if side == "BUY":
-        amount = min(trade_amount, stats.balance)
-        if amount < 0.01:
-            return  # no balance
+        paper_amount = min(trade_amount, stats.balance)
+        if paper_amount < 0.01:
+            return None
 
-        fee_rate = calc_taker_fee(fill_price)
-        taker_fee = amount * fee_rate
-        shares = amount / fill_price if fill_price > 0 else 0
+        fee_rate = calc_taker_fee(price)
+        taker_fee = paper_amount * fee_rate
+        shares = paper_amount / price if price > 0 else 0
 
-        stats.balance -= (amount + taker_fee)
+        stats.balance -= (paper_amount + taker_fee)
         stats.buys += 1
-        stats.total_wagered += amount
+        stats.total_wagered += paper_amount
 
-        # Track position
+        # Track the position keyed by token_id
         positions[token_id] = PaperPosition(
             token_id=token_id,
             side="BUY",
-            entry_price=fill_price,
-            amount=amount,
+            entry_price=price,
+            amount=paper_amount,
             shares=shares,
-            market_title=market_title,
-            opened_at=timestamp,
+            market_title=title,
+            slug=slug,
+            outcome=outcome,
+            opened_at=ts_str,
         )
 
     elif side == "SELL":
         if token_id in positions:
             pos = positions.pop(token_id)
-            amount = pos.amount
+            paper_amount = pos.amount
 
-            fee_rate = calc_taker_fee(fill_price)
-            taker_fee = pos.amount * fee_rate
+            fee_rate = calc_taker_fee(price)
+            taker_fee = paper_amount * fee_rate
 
-            # Sell proceeds: shares * fill_price
-            proceeds = pos.shares * fill_price
+            proceeds = pos.shares * price
             pnl = proceeds - pos.amount - taker_fee
 
             stats.balance += (proceeds - taker_fee)
@@ -373,127 +369,129 @@ async def paper_execute(
             stats.best_trade = max(stats.best_trade, pnl)
             stats.worst_trade = min(stats.worst_trade, pnl)
         else:
-            # Sell without a tracked position — just log it
-            amount = trade_amount
-            stats.sells += 1
-
-            trade = Trade(
-                trade_id=trade_id,
-                timestamp=timestamp,
-                token_id=token_id,
-                market_title=market_title,
-                side=side,
-                fill_price=fill_price,
-                amount=0,
-                taker_fee=0,
-                pnl=0,
-                balance_after=stats.balance,
-            )
-            stats.trades.append(trade)
-            stats.total_trades += 1
-            log_trade_csv(CSV_FILE, trade, stats)
-
-            update_ui(stats=stats, positions=positions)
-            return
-
+            # Sell without a tracked buy — log but don't affect balance
+            paper_amount = 0
         stats.sells += 1
 
     stats.peak_balance = max(stats.peak_balance, stats.balance)
     stats.valley_balance = min(stats.valley_balance, stats.balance)
 
     trade = Trade(
-        trade_id=trade_id,
-        timestamp=timestamp,
+        trade_id=tx_hash[:16] if tx_hash else str(int(time.time())),
+        timestamp=ts_str,
         token_id=token_id,
-        market_title=market_title,
+        market_title=title,
+        slug=slug,
         side=side,
-        fill_price=fill_price,
-        amount=amount,
+        outcome=outcome,
+        original_price=price,
+        original_size_usd=usdc_size,
+        paper_amount=paper_amount,
         taker_fee=taker_fee,
         pnl=pnl,
         balance_after=stats.balance,
     )
 
     stats.trades.append(trade)
-    stats.total_trades += 1
+    stats.total_copied += 1
 
-    log_trade_csv(CSV_FILE, trade, stats)
-    update_ui(stats=stats, positions=positions)
+    return trade
 
 
 # ─────────────────────────────────────────────────────────────
-# WEBSOCKET WATCHER
+# POLL LOOP
 # ─────────────────────────────────────────────────────────────
 
-processed_trades: set = set()
-
-async def watch_trader(
+async def poll_trades(
     session: aiohttp.ClientSession,
     wallet: str,
     stats: Stats,
     positions: dict,
     trade_amount: float,
+    csv_file: str,
 ):
-    """Persistent WebSocket listening to Polymarket RTDS for a specific user."""
-    global ws_status
+    """Poll the Data API for new trades from the target wallet."""
+    global feed_status, last_poll_time, polls_completed
 
+    seen_txns: set[str] = set()
+    pseudonym = ""
+
+    # Initial fetch to seed the "seen" set so we don't replay history
+    try:
+        url = f"{DATA_API}/activity?user={wallet}&limit=50"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for item in data:
+                    tx = item.get("transactionHash", "")
+                    if tx:
+                        seen_txns.add(tx)
+                    # Grab pseudonym from first response
+                    if not pseudonym and item.get("pseudonym"):
+                        pseudonym = item["pseudonym"]
+                        update_ui(pseudonym=pseudonym)
+                feed_status = "polling"
+                last_poll_time = time.time()
+                polls_completed += 1
+    except Exception:
+        pass
+
+    update_ui(stats=stats, positions=positions)
+
+    # Main poll loop
     while True:
+        await asyncio.sleep(POLL_INTERVAL)
+
         try:
-            ws_status = "connecting"
+            url = f"{DATA_API}/activity?user={wallet}&limit=20"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    feed_status = "error"
+                    update_ui(stats=stats, positions=positions)
+                    continue
+
+                data = await resp.json()
+
+            feed_status = "polling"
+            last_poll_time = time.time()
+            polls_completed += 1
+
+            # Process new trades (they come newest-first, reverse to process chronologically)
+            new_trades = []
+            for item in reversed(data):
+                tx = item.get("transactionHash", "")
+                if not tx or tx in seen_txns:
+                    continue
+                if item.get("type") != "TRADE":
+                    continue
+
+                seen_txns.add(tx)
+                new_trades.append(item)
+
+                # Grab pseudonym if not yet known
+                if not pseudonym and item.get("pseudonym"):
+                    pseudonym = item["pseudonym"]
+                    update_ui(pseudonym=pseudonym)
+
+            for item in new_trades:
+                trade = process_trade(item, stats, positions, trade_amount)
+                if trade:
+                    log_trade_csv(csv_file, trade, stats)
+
             update_ui(stats=stats, positions=positions)
 
-            async with websockets.connect(LIVE_DATA_WS, ping_interval=20) as ws:
-                # Subscribe to the target user's trade channel
-                sub_msg = {
-                    "type": "subscribe",
-                    "channel": "user",
-                    "address": wallet.lower(),
-                }
-                await ws.send(json.dumps(sub_msg))
-                ws_status = "connected"
-                update_ui(stats=stats, positions=positions)
-
-                async for msg in ws:
-                    data = json.loads(msg)
-
-                    # Filter for matched trade events
-                    if data.get("event") == "trade" and data.get("status") == "MATCHED":
-                        trade_id = data.get("id", "")
-
-                        # Deduplication
-                        if trade_id in processed_trades:
-                            continue
-                        processed_trades.add(trade_id)
-
-                        side = data.get("side", "BUY").upper()
-                        token_id = data.get("asset_id", "")
-
-                        if not token_id:
-                            continue
-
-                        # Fire paper execution async so we don't block the stream
-                        asyncio.create_task(
-                            paper_execute(
-                                session, trade_id, token_id, side,
-                                stats, positions, trade_amount,
-                            )
-                        )
-
-        except websockets.ConnectionClosed:
-            ws_status = "reconnecting"
-            update_ui(stats=stats, positions=positions)
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            ws_status = "reconnecting"
+            feed_status = "error"
             update_ui(stats=stats, positions=positions)
-
-        await asyncio.sleep(2)
 
 
 # ─────────────────────────────────────────────────────────────
 # FINAL REPORT
 # ─────────────────────────────────────────────────────────────
 
-def print_final_report(stats: Stats, wallet: str, positions: dict):
+def print_final_report(stats: Stats, wallet: str, positions: dict, csv_file: str):
     """Print comprehensive final report."""
     print("\033[2J\033[H", end="", flush=True)
     pnl_c = GREEN if stats.realized_pnl >= 0 else RED
@@ -517,7 +515,7 @@ def print_final_report(stats: Stats, wallet: str, positions: dict):
     print(f"  └─ Valley balance:     {RED}${stats.valley_balance:.4f}{R}")
     print()
     print(f"  {B}Overview{R}")
-    print(f"  ├─ Total trades:       {stats.total_trades}")
+    print(f"  ├─ Total copied:       {stats.total_copied}")
     print(f"  ├─ Buys:               {stats.buys}")
     print(f"  ├─ Sells:              {stats.sells}")
     print(f"  └─ Open positions:     {len(positions)}")
@@ -531,12 +529,11 @@ def print_final_report(stats: Stats, wallet: str, positions: dict):
         print(f"  ├─ Realized P&L:       {pnl_c}{B}{pnl_s}${stats.realized_pnl:.4f}{R}")
         print(f"  ├─ Total wagered:      ${stats.total_wagered:.2f}")
         print(f"  ├─ ROI:                {pnl_c}{pnl_s}{stats.roi:.1f}%{R}")
-        if closed > 0:
-            avg = stats.realized_pnl / closed
-            print(f"  ├─ Average P&L:        ${avg:.4f} / trade")
+        avg = stats.realized_pnl / closed
+        print(f"  ├─ Average P&L:        ${avg:.4f} / trade")
         print(f"  ├─ Best trade:         {GREEN}+${stats.best_trade:.4f}{R}")
         print(f"  └─ Worst trade:        {RED}${stats.worst_trade:.4f}{R}")
-    elif stats.total_trades > 0:
+    elif stats.total_copied > 0:
         print(f"  {YELLOW}Only buys detected — no closed positions to evaluate.{R}")
     else:
         print(f"  {YELLOW}No trades were copied during this session.{R}")
@@ -546,9 +543,9 @@ def print_final_report(stats: Stats, wallet: str, positions: dict):
     # Trade log
     if stats.trades:
         print(f"  {B}Trade Log{R}")
-        print(f"  {'#':>3}  {'Side':>5}  {'Fill @':>8}  "
-              f"{'Amount':>8}  {'P&L':>10}  {'Balance':>10}  {'Market'}")
-        print(f"  {'─' * 70}")
+        print(f"  {'#':>3}  {'Side':>5}  {'Price':>7}  "
+              f"{'Paper$':>7}  {'Orig$':>7}  {'P&L':>10}  {'Balance':>10}  {'Market'}")
+        print(f"  {'─' * 75}")
         for i, t in enumerate(stats.trades, 1):
             side_c = GREEN if t.side == "BUY" else MAGENTA
             if t.pnl != 0:
@@ -559,14 +556,15 @@ def print_final_report(stats: Stats, wallet: str, positions: dict):
                 pnl_str = f"{D}{'—':>10}{R}"
             bc = GREEN if t.balance_after >= stats.starting_balance else RED
             print(f"  {i:>3}  {side_c}{t.side:>5}{R}  "
-                  f"${t.fill_price:>6.4f}  "
-                  f"${t.amount:>6.2f}  "
+                  f"${t.original_price:>5.2f}  "
+                  f"${t.paper_amount:>5.2f}  "
+                  f"${t.original_size_usd:>5.2f}  "
                   f"{pnl_str}  "
                   f"{bc}${t.balance_after:>8.4f}{R}  "
                   f"{t.market_title[:25]}")
 
     print()
-    print(f"  {D}Full log saved to: {CSV_FILE}{R}")
+    print(f"  {D}Full log saved to: {csv_file}{R}")
     print(f"{B}{'═' * 64}{R}")
     print()
 
@@ -576,9 +574,11 @@ def print_final_report(stats: Stats, wallet: str, positions: dict):
 # ─────────────────────────────────────────────────────────────
 
 async def main(wallet: str, starting_balance: float, trade_amount: float):
-    """Run paper copy trader — watch wallet and simulate trades."""
+    """Run paper copy trader — poll wallet activity and simulate trades."""
     global bot_start_time
     bot_start_time = time.time()
+
+    csv_file = csv_path_for_wallet(wallet)
 
     session = create_session()
     shutdown = asyncio.Event()
@@ -591,32 +591,32 @@ async def main(wallet: str, starting_balance: float, trade_amount: float):
     )
     positions: dict[str, PaperPosition] = {}
 
-    # Inject wallet and trade_amount into UI state so build_screen can access them
     update_ui(
         stats=stats,
         wallet=wallet,
         positions=positions,
         trade_amount=trade_amount,
+        pseudonym="",
     )
 
     ui_task = asyncio.create_task(ui_renderer(build_screen, shutdown))
-
-    init_csv(CSV_FILE)
+    init_csv(csv_file)
 
     print(f"📋 Paper Copy Trader starting...")
     print(f"👁️  Watching wallet: {wallet}")
     print(f"💰 Starting balance: ${starting_balance:.2f}")
-    print(f"🎯 Trade amount: ${trade_amount:.2f}\n")
+    print(f"🎯 Trade amount: ${trade_amount:.2f}")
+    print(f"🔄 Polling every {POLL_INTERVAL}s\n")
 
     try:
-        await watch_trader(session, wallet, stats, positions, trade_amount)
+        await poll_trades(session, wallet, stats, positions, trade_amount, csv_file)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
         shutdown.set()
         ui_task.cancel()
         await session.close()
-        print_final_report(stats, wallet, positions)
+        print_final_report(stats, wallet, positions, csv_file)
 
 
 if __name__ == "__main__":
@@ -641,7 +641,15 @@ if __name__ == "__main__":
         default=5.0,
         help="Fixed amount to paper-trade per copied trade (default: $5)",
     )
+    parser.add_argument(
+        "--poll-interval", "-p",
+        type=int,
+        default=5,
+        help="Seconds between API polls (default: 5)",
+    )
     args = parser.parse_args()
+
+    POLL_INTERVAL = args.poll_interval
 
     try:
         asyncio.run(main(
